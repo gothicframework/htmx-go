@@ -1,0 +1,131 @@
+# Scheduled upstream-drift watch for the projects this repo ports.
+#
+# htmx-go tracks specific upstream versions (see ext/versions.json). This workflow
+# runs the detector in .github/upstream-watch, and when an upstream has moved ahead
+# of its pin it opens (or leaves in place) a single GitHub issue labelled
+# `upstream-update`. It is NOTIFY-ONLY: it never opens a PR and never bumps a pin —
+# a human decides whether and when to port the new upstream version.
+#
+# Notification channel: this posts a GitHub issue. A maintainer who would rather be
+# emailed can either watch the `upstream-update` label, or replace the "Notify"
+# step below with a mail/webhook step (e.g. dawidd6/action-send-mail) — the
+# detector's JSON report is channel-agnostic.
+name: upstream-watch
+
+on:
+  schedule:
+    # Daily at 07:13 UTC. Off the hour to avoid the top-of-hour scheduling surge.
+    - cron: "13 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # The detector is its own module under .github/upstream-watch (kept out of
+      # the htmx-go wasm build). Run it from there, pointing at the manifest at the
+      # repo root. It writes `drift` and `report` to $GITHUB_OUTPUT.
+      - name: Detect upstream drift
+        id: detect
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        working-directory: .github/upstream-watch
+        run: go run . --manifest ../../ext/versions.json
+
+      - name: Show report
+        run: |
+          echo "drift=${{ steps.detect.outputs.drift }}"
+          cat <<'REPORT'
+          ${{ steps.detect.outputs.report }}
+          REPORT
+
+      # For each drifted port, ensure exactly one open issue exists for THAT
+      # version. The issue title encodes the upstream version, so a new upstream
+      # version yields a new issue while re-runs for the same version are no-ops
+      # (idempotent). sigv4 never drifts, so it never reaches this step.
+      - name: Notify on drift
+        if: steps.detect.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.detect.outputs.report }}
+        run: |
+          set -euo pipefail
+
+          # Make sure the label exists (ignore "already exists").
+          gh label create upstream-update \
+            --description "An upstream project this repo ports has a newer version than the pin" \
+            --color FBCA04 2>/dev/null || true
+
+          echo "$REPORT" | jq -c '.findings[] | select(.drift == true)' | while read -r finding; do
+            title=$(echo "$finding" | jq -r '.title')
+            name=$(echo "$finding" | jq -r '.name')
+            repo=$(echo "$finding" | jq -r '.repo // ""')
+            pinned=$(echo "$finding" | jq -r '.pinned')
+            latest=$(echo "$finding" | jq -r '.latest')
+            url=$(echo "$finding" | jq -r '.url // ""')
+
+            # Idempotency guard: skip if an open issue with this exact title and the
+            # upstream-update label already exists.
+            existing=$(gh issue list \
+              --state open \
+              --label upstream-update \
+              --json number,title \
+              --jq "map(select(.title == \"$title\")) | length")
+
+            if [ "$existing" != "0" ]; then
+              echo "Issue already open for: $title — skipping."
+              continue
+            fi
+
+            body=$(cat <<EOF
+          The upstream project this repo's \`$name\` port tracks has published a version newer than the pin.
+
+          | | Version |
+          |---|---|
+          | Pinned (this repo) | \`$pinned\` |
+          | Latest upstream | \`$latest\` |
+
+          - Upstream repo: \`$repo\`
+          - Release / changelog: $url
+
+          ### To adopt
+
+          1. Port the upstream changes into the Go/WASM source for \`$name\`.
+          2. Update the code marker (\`htmx.go\` \`Version\` const, or the \`ext/preload\` header).
+          3. Update the matching \`pinned\` value in \`ext/versions.json\`.
+
+          This is an automated notification from the \`upstream-watch\` workflow. It does not change any code. Close this issue once the pin is updated or the update is intentionally deferred.
+          EOF
+          )
+
+            echo "Opening issue: $title"
+            gh issue create \
+              --title "$title" \
+              --label upstream-update \
+              --body "$body"
+          done
+
+      - name: Note on sigv4 (informational)
+        run: |
+          echo "$sigv4_note"
+        env:
+          # sigv4 is a Gothic-original port with no upstream package to diff.
+          # A human periodically reviews the AWS SigV4 specification; the watcher
+          # never files drift for it.
+          sigv4_note: "sigv4 is a Gothic-original port — no upstream package to watch; reviewed manually against the AWS SigV4 spec."

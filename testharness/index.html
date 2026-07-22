@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>htmx-go WASM validation harness</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 1.5rem; max-width: 60rem; }
+    section { border: 1px solid #8884; border-radius: 8px; padding: 1rem; margin: 0 0 1rem; }
+    h1 { font-size: 1.15rem; margin: 0 0 1rem; }
+    h2 { font-size: .9rem; text-transform: uppercase; letter-spacing: .04em; opacity: .7; margin: 0 0 .6rem; }
+    button, a.btn { cursor: pointer; }
+    /* Big spacer so `revealed` only fires after an explicit scroll. */
+    #reveal-spacer { height: 130vh; }
+    [data-testid] { scroll-margin-top: 1rem; }
+    code { background: #8882; padding: .05em .3em; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <!--
+    Browser validation harness for the compiled htmx-go WASM port.
+    Loads wasm_exec.js + htmx.wasm, boots window.htmx (with the preload extension
+    registered), then signals readiness deterministically so Playwright never has
+    to guess: it sets document.body.dataset.wasmReady = "1" AND dispatches a
+    "wasm-ready" event on window. Wait on EITHER — never on networkidle, because
+    the `every` polling triggers below keep the network busy forever.
+  -->
+
+  <h1>htmx-go WASM validation harness</h1>
+
+  <!-- ───────────────────────── hx-get / basic request ───────────────────────── -->
+  <section>
+    <h2>hx-get + hx-target (CSS selector)</h2>
+    <button id="btn-get" data-testid="get-basic"
+            hx-get="/fragment" hx-target="#get-out" hx-swap="innerHTML">
+      GET /fragment
+    </button>
+    <div id="get-out" data-testid="get-out"><em>empty</em></div>
+  </section>
+
+  <!-- ───────────────────────── hx-post form (echo body) ───────────────────────── -->
+  <section>
+    <h2>hx-post form — body echo + configRequest header mutation</h2>
+    <form id="echo-form" data-testid="echo-form"
+          hx-post="/echo" hx-target="#echo-out" hx-swap="innerHTML">
+      <input type="text" name="alpha" value="one">
+      <input type="text" name="beta" value="two">
+      <button type="submit" data-testid="echo-submit">POST /echo</button>
+    </form>
+    <pre id="echo-out" data-testid="echo-out"><em>empty</em></pre>
+  </section>
+
+  <!-- ───────────────────────── every hx-swap mode ───────────────────────── -->
+  <section>
+    <h2>hx-swap modes</h2>
+
+    <button data-testid="swap-innerHTML" hx-get="/fragment" hx-target="#swap-inner" hx-swap="innerHTML">innerHTML</button>
+    <div id="swap-inner" data-testid="swap-inner-out">original-inner</div>
+
+    <button data-testid="swap-outerHTML" hx-get="/fragment" hx-target="#swap-outer" hx-swap="outerHTML">outerHTML</button>
+    <div id="swap-outer" data-testid="swap-outer-out">original-outer</div>
+
+    <button data-testid="swap-beforeend" hx-get="/fragment" hx-target="#swap-beforeend" hx-swap="beforeend">beforeend</button>
+    <div id="swap-beforeend" data-testid="swap-beforeend-out"><span>seed</span></div>
+
+    <button data-testid="swap-afterbegin" hx-get="/fragment" hx-target="#swap-afterbegin" hx-swap="afterbegin">afterbegin</button>
+    <div id="swap-afterbegin" data-testid="swap-afterbegin-out"><span>seed</span></div>
+
+    <button data-testid="swap-delete" hx-get="/fragment" hx-target="#swap-delete" hx-swap="delete">delete</button>
+    <div id="swap-delete" data-testid="swap-delete-out">delete-me</div>
+
+    <button data-testid="swap-none" hx-get="/fragment" hx-target="#swap-none" hx-swap="none">none</button>
+    <div id="swap-none" data-testid="swap-none-out">unchanged-by-none</div>
+  </section>
+
+  <!-- ───────────────────────── out-of-band swap ───────────────────────── -->
+  <section>
+    <h2>hx-swap-oob</h2>
+    <button data-testid="oob-trigger" hx-get="/oob" hx-target="#oob-primary" hx-swap="innerHTML">GET /oob</button>
+    <div id="oob-primary" data-testid="oob-primary"><em>primary empty</em></div>
+    <!-- The /oob response carries an element with hx-swap-oob="true" id="oob-target"
+         that htmx must route here regardless of hx-target. -->
+    <div id="oob-target" data-testid="oob-target">oob original</div>
+  </section>
+
+  <!-- ───────────────────────── hx-target variants ───────────────────────── -->
+  <section>
+    <h2>hx-target variants</h2>
+
+    <button data-testid="target-this" hx-get="/fragment" hx-target="this" hx-swap="innerHTML">target: this</button>
+
+    <div class="closest-box" style="padding:.4rem;border:1px dashed #8888">
+      <button data-testid="target-closest" hx-get="/fragment" hx-target="closest .closest-box" hx-swap="beforeend">target: closest .closest-box</button>
+    </div>
+
+    <!-- `find` searches DESCENDANTS of the requesting element, so the sink must
+         live inside the element that carries hx-target="find …". -->
+    <div data-testid="target-find" hx-get="/fragment" hx-trigger="click"
+         hx-target="find .find-sink" hx-swap="innerHTML"
+         style="cursor:pointer;padding:.4rem;border:1px dashed #8888">
+      target: find .find-sink (click me)
+      <div class="find-sink" data-testid="find-sink">find original</div>
+    </div>
+
+    <button data-testid="target-next" hx-get="/fragment" hx-target="next .next-sink" hx-swap="innerHTML">target: next</button>
+    <div class="next-sink" data-testid="next-sink">next original</div>
+
+    <div class="prev-sink" data-testid="prev-sink">prev original</div>
+    <button data-testid="target-previous" hx-get="/fragment" hx-target="previous .prev-sink" hx-swap="innerHTML">target: previous</button>
+  </section>
+
+  <!-- ───────────────────────── hx-trigger variants ───────────────────────── -->
+  <section>
+    <h2>hx-trigger variants</h2>
+
+    <button data-testid="trig-delay" hx-get="/fragment" hx-trigger="click delay:200ms" hx-target="#trig-delay-out" hx-swap="innerHTML">click delay:200ms</button>
+    <div id="trig-delay-out" data-testid="trig-delay-out">delay original</div>
+
+    <button data-testid="trig-throttle" hx-get="/fragment" hx-trigger="click throttle:500ms" hx-target="#trig-throttle-out" hx-swap="innerHTML">click throttle:500ms</button>
+    <div id="trig-throttle-out" data-testid="trig-throttle-out">throttle original</div>
+
+    <button data-testid="trig-once" hx-get="/fragment" hx-trigger="click once" hx-target="#trig-once-out" hx-swap="beforeend">click once</button>
+    <div id="trig-once-out" data-testid="trig-once-out"></div>
+
+    <!-- `changed` only requests when the value actually changes between events -->
+    <input data-testid="trig-changed" type="text" value="seed"
+           hx-get="/fragment" hx-trigger="keyup changed delay:100ms" hx-target="#trig-changed-out" hx-swap="innerHTML">
+    <div id="trig-changed-out" data-testid="trig-changed-out">changed original</div>
+
+    <!-- `from:` — listen for an event originating on a different element -->
+    <button data-testid="trig-from-source">click me (source)</button>
+    <div data-testid="trig-from" hx-get="/fragment" hx-trigger="click from:[data-testid='trig-from-source']" hx-target="this" hx-swap="innerHTML">from original</div>
+
+    <!-- `load` — fires once as soon as the element is processed -->
+    <div data-testid="trig-load" hx-get="/fragment" hx-trigger="load" hx-target="this" hx-swap="innerHTML">load original</div>
+
+    <!-- `every` — polling. Points at /tick so it is observable and cheap. -->
+    <div data-testid="trig-every" hx-get="/tick" hx-trigger="every 1s" hx-target="this" hx-swap="innerHTML">tick original</div>
+  </section>
+
+  <!-- ───────────────────────── hx-push-url ───────────────────────── -->
+  <section>
+    <h2>hx-push-url</h2>
+    <a id="push-link" data-testid="push-link" class="btn"
+       href="/pushed" hx-get="/fragment" hx-push-url="true" hx-target="#push-out" hx-swap="innerHTML">
+      GET /fragment (push /pushed)
+    </a>
+    <div id="push-out" data-testid="push-out">push original</div>
+  </section>
+
+  <!-- ───────────────────────── swapped <script> executes ───────────────────────── -->
+  <section>
+    <h2>swapped &lt;script&gt; executes + re-wires nested htmx</h2>
+    <button data-testid="script-trigger" hx-get="/script-fragment" hx-target="#script-out" hx-swap="innerHTML">GET /script-fragment</button>
+    <div id="script-out" data-testid="script-out">script sink empty</div>
+    <!-- The fragment sets window.__scriptFragmentRan = true and includes a NESTED
+         hx-get button; if htmx.process re-wires the swapped subtree, that nested
+         button will itself be able to fire a request. -->
+  </section>
+
+  <!-- ───────────────────────── preload extension ───────────────────────── -->
+  <section hx-ext="preload">
+    <h2>preload extension (hx-ext="preload")</h2>
+    <a id="preload-link" data-testid="preload-link" class="btn"
+       href="#" hx-get="/fragment" preload="mouseover" hx-target="#preload-out" hx-swap="innerHTML">
+      preload on mouseover
+    </a>
+    <div id="preload-out" data-testid="preload-out">preload sink empty</div>
+  </section>
+
+  <!-- ───────────────────────── abort / slow request ───────────────────────── -->
+  <section>
+    <h2>slow request (for abort tests)</h2>
+    <button data-testid="slow-trigger" hx-get="/slow" hx-target="#slow-out" hx-swap="innerHTML">GET /slow (delayed)</button>
+    <div id="slow-out" data-testid="slow-out">slow original</div>
+  </section>
+
+  <!-- ───────────────────────── revealed (needs scroll) ───────────────────────── -->
+  <div id="reveal-spacer" aria-hidden="true"></div>
+  <section>
+    <h2>hx-trigger="revealed"</h2>
+    <div data-testid="trig-revealed" hx-get="/fragment" hx-trigger="revealed" hx-target="this" hx-swap="innerHTML">revealed original</div>
+  </section>
+
+  <script src="wasm_exec.js"></script>
+  <script>
+    // ── configRequest listener: proves detail.headers are mutable by third-party
+    //    listeners (the downstream AWS request signer contract). Registered on
+    //    document as a plain bubbling-event listener so it works no matter when
+    //    htmx boots. The /echo endpoint reflects the injected header back so the
+    //    spec can assert it round-tripped. This fires on EVERY htmx request,
+    //    including the boot-time `load`/`revealed` triggers, so it must stay
+    //    panic-safe.
+    //
+    //    NOTE (validation finding): mutating detail.parameters with a STRING
+    //    value currently panics the Go/WASM runtime — the parameters proxy `set`
+    //    trap (htmx.go:3404) calls js.Value.Get("forEach") on the string value,
+    //    and syscall/js panics on Get() against a non-object. In upstream
+    //    htmx.js the same path is a harmless `undefined`. So this always-on
+    //    listener deliberately does NOT set a string parameter. A targeted QA
+    //    test can reproduce the panic in isolation (see the harness report).
+    document.addEventListener("htmx:configRequest", function (evt) {
+      evt.detail.headers["X-Gothic-Test"] = "signed";
+    });
+
+    (async function bootWasm() {
+      try {
+        const go = new Go();
+        const result = await WebAssembly.instantiateStreaming(
+          fetch("htmx.wasm"),
+          go.importObject
+        );
+        // Run the Go program. It calls htmx.Boot() + preload.Register() then
+        // blocks on select{} — so go.run() never resolves; do NOT await it.
+        go.run(result.instance);
+
+        // htmx.Boot() runs synchronously inside go.run() before it parks on
+        // select{} (readyState is already "complete", so processNode(body) fires
+        // immediately). By the time control returns here, window.htmx exists.
+        if (!window.htmx) {
+          throw new Error("go.run() returned but window.htmx is undefined");
+        }
+
+        document.body.dataset.wasmReady = "1";
+        window.dispatchEvent(new CustomEvent("wasm-ready", {
+          detail: { version: window.htmx.version }
+        }));
+      } catch (err) {
+        document.body.dataset.wasmError = String(err && err.message || err);
+        // Surface to the console so the smoke test can fail loudly.
+        console.error("wasm boot failed:", err);
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "htmx-go-testharness",
+  "private": true,
+  "description": "Browser validation harness for the compiled htmx-go WASM port",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "$comment": "Single source of truth for the upstream versions this repo's ports track. Bumping a port means updating BOTH the code (htmx.go Version const / ext/preload header) AND the matching 'pinned' value here. The scheduled upstream-watch GitHub Action reads this file and notifies (issue-only) when an upstream moves ahead of a pin. It never auto-updates.",
+  "htmx": {
+    "repo": "bigskysoftware/htmx",
+    "pinned": "2.0.9",
+    "code": "htmx.go (const Version)",
+    "method": "GitHub releases/latest tag_name"
+  },
+  "preload": {
+    "repo": "bigskysoftware/htmx-extensions",
+    "path": "src/preload",
+    "pinned": "2.0.1",
+    "code": "ext/preload/preload.go (package header)",
+    "method": "src/preload/package.json version on the default branch (no per-extension release tags exist)"
+  },
+  "sigv4": {
+    "upstream": "aws-sigv4-algorithm",
+    "pinned": "n/a",
+    "code": "ext/sigv4/",
+    "note": "Gothic-original port of the AWS SigV4 body-hash signing algorithm. There is no upstream JS package to diff against; a human periodically reviews the AWS SigV4 specification. The watcher emits an informational note only and never flags drift."
+  }
+}
