@@ -83,7 +83,13 @@ func jstr(v js.Value) string {
 }
 
 // safe runs fn, returning true if a JS exception was thrown (Call panics with a
-// js.Error on a thrown JS exception). Mirrors JS try/catch.
+// js.Error on a thrown JS exception).
+//
+// It only contains anything on a toolchain that implements recover for the target:
+// TinyGo has no recover on wasm32, where a panic prints and traps instead of
+// reaching the defer. Prefer jsTry/jsTryNew/jsTryGet, which move the try/catch into
+// JS and work on every toolchain; safe is the last resort for a throw that can only
+// arise from Go code, which no JS try/catch can wrap.
 func safe(fn func()) (threw bool) {
 	defer func() {
 		if recover() != nil {
@@ -94,7 +100,82 @@ func safe(fn func()) (threw bool) {
 	return false
 }
 
-func logError(v any) { global.Get("console").Call("error", v) }
+// tryCallBridge resolves the host page's optional __htmxTryCall helper, caching it
+// once found. It is an optional page asset, never a hard dependency of this module.
+func tryCallBridge() js.Value {
+	if isFunction(tryCallFn) {
+		return tryCallFn
+	}
+	tryCallFn = global.Get("__htmxTryCall")
+	return tryCallFn
+}
+
+var tryCallFn js.Value
+
+// jsTry invokes target[method](args...) and reports whether it completed, so a throw
+// from JS (a third-party extension, a user event-filter expression, a builtin
+// rejecting its input) becomes a value instead of an instance-killing trap.
+//
+// With the host's __htmxTryCall bridge the try/catch runs in JS and holds on every
+// toolchain; without it the call is direct and only a recover-capable toolchain
+// contains the throw. The returned value is undefined when the call did not complete.
+func jsTry(target js.Value, method string, args ...any) (js.Value, bool) {
+	bridge := tryCallBridge()
+	if !isFunction(bridge) {
+		out := undefined
+		threw := safe(func() { out = target.Call(method, args...) })
+		return out, !threw
+	}
+	all := make([]any, 0, len(args)+2)
+	all = append(all, target, method)
+	all = append(all, args...)
+	res := bridge.Invoke(all...)
+	if res.Type() != js.TypeObject || !res.Get("ok").Truthy() {
+		return undefined, false
+	}
+	return res.Get("v"), true
+}
+
+// jsTryNew constructs new ctor(args...) under the same protection as jsTry.
+// Reflect.construct keeps it a plain method call, so one primitive covers both.
+func jsTryNew(ctor js.Value, args ...any) (js.Value, bool) {
+	arr := global.Get("Array").New()
+	for _, a := range args {
+		arr.Call("push", a)
+	}
+	return jsTry(global.Get("Reflect"), "construct", ctor, arr)
+}
+
+// jsTryGet reads target[prop] under the same protection as jsTry.
+// A direct js.Value.Get on a property whose getter throws (window.sessionStorage in
+// a sandboxed frame) is unconditionally fatal, because syscall/js only reports
+// throws for Call/Invoke/New — routing the read through Reflect.get makes it one.
+func jsTryGet(target js.Value, prop string) (js.Value, bool) {
+	return jsTry(global.Get("Reflect"), "get", target, prop)
+}
+
+// jsSafeValue converts v for the crossing into JS, yielding undefined for a type
+// js.ValueOf rejects. js.ValueOf panics on anything outside Value, Func, nil, bool,
+// the numeric types, string, []any and map[string]any — a Go pointer or struct
+// reaching it kills the instance.
+func jsSafeValue(v any) js.Value {
+	switch t := v.(type) {
+	case nil:
+		return null
+	case js.Value:
+		return t
+	case js.Func:
+		return t.Value
+	case bool, string, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, float32, float64,
+		[]any, map[string]any:
+		return js.ValueOf(t)
+	}
+	global.Get("console").Call("error", "htmx: value of unsupported Go type dropped at the JS boundary")
+	return undefined
+}
+
+func logError(v any) { global.Get("console").Call("error", jsSafeValue(v)) }
 
 // newObject builds a plain JS object from key/value pairs.
 func newObject() js.Value { return global.Get("Object").New() }
@@ -401,9 +482,11 @@ func normalizeScriptTags(fragment js.Value) {
 	for _, script := range jsArrayToSlice(fragment.Call("querySelectorAll", "script")) {
 		if isJavaScriptScriptNode(script) {
 			newScript := duplicateScript(script)
-			parent := script.Get("parentNode")
-			threw := safe(func() { parent.Call("insertBefore", newScript, script) })
-			if threw {
+			// insertBefore cannot fail for a reference node that IS parent's child, so
+			// the only failure is a detached script with no parent to insert into.
+			if parent := script.Get("parentNode"); parent.Truthy() {
+				parent.Call("insertBefore", newScript, script)
+			} else {
 				logError("htmx: failed to insert script")
 			}
 			script.Call("remove")
@@ -506,9 +589,8 @@ func parseJSON(jString string) js.Value {
 	if jString == "" {
 		return null
 	}
-	var out js.Value = null
-	threw := safe(func() { out = global.Get("JSON").Call("parse", jString) })
-	if threw {
+	out, ok := jsTry(global.Get("JSON"), "parse", jString)
+	if !ok {
 		logError("htmx: invalid JSON")
 		return null
 	}
@@ -517,20 +599,26 @@ func parseJSON(jString string) js.Value {
 
 func canAccessLocalStorage() bool {
 	const test = "htmx:sessionStorageTest"
-	return !safe(func() {
-		ss := global.Get("sessionStorage")
-		ss.Call("setItem", test, test)
-		ss.Call("removeItem", test)
-	})
+	// The property read is part of the probe: window.sessionStorage itself throws when
+	// storage is blocked (sandboxed frame, cookies disabled), before any method call.
+	ss, ok := jsTryGet(global, "sessionStorage")
+	if !ok || !ss.Truthy() {
+		return false
+	}
+	if _, ok := jsTry(ss, "setItem", test, test); !ok {
+		return false
+	}
+	_, ok = jsTry(ss, "removeItem", test)
+	return ok
 }
 
 var trailingSlashRe = regexp.MustCompile(`/+$`)
 
 func normalizePath(path string) string {
-	safe(func() {
-		url := global.Get("URL").New(path, location().Get("href"))
+	// new URL rejects a path that is not resolvable against the current href.
+	if url, ok := jsTryNew(global.Get("URL"), path, location().Get("href")); ok {
 		path = url.Get("pathname").String() + url.Get("search").String()
-	})
+	}
 	if path != "/" {
 		path = trailingSlashRe.ReplaceAllString(path, "")
 	}
@@ -943,9 +1031,9 @@ func cloneAttributes(mergeTo, mergeFrom js.Value) {
 
 func isInlineSwap(swapStyle string, target js.Value) bool {
 	for _, extension := range getExtensions(target, nil, nil) {
-		var inline bool
-		safe(func() { inline = extension.Call("isInlineSwap", swapStyle).Bool() })
-		if inline {
+		// Third-party extension code: bridge the call, and read the result for
+		// truthiness as htmx.js does — .Bool() on a non-boolean return would panic.
+		if inline, ok := jsTry(extension, "isInlineSwap", swapStyle); ok && inline.Truthy() {
 			return true
 		}
 	}
@@ -961,6 +1049,41 @@ type settleInfo struct {
 
 func makeSettleInfo(target js.Value) *settleInfo {
 	return &settleInfo{elts: []js.Value{target}, title: undefined}
+}
+
+// jsSettleInfo mirrors a settleInfo into the plain JS object an extension's
+// handleSwap receives. A Go pointer cannot cross into JS, and extensions queue
+// settle tasks on the object they are handed, so the mirror is folded back with
+// mergeSettleInfo once the extension returns.
+func jsSettleInfo(si *settleInfo) js.Value {
+	mirror := newObject()
+	mirror.Set("tasks", global.Get("Array").New())
+	elts := global.Get("Array").New()
+	for _, elt := range si.elts {
+		elts.Call("push", elt)
+	}
+	mirror.Set("elts", elts)
+	mirror.Set("title", si.title)
+	return mirror
+}
+
+// mergeSettleInfo folds an extension's additions back into the Go settleInfo:
+// the settle tasks it queued, the elements it appended, and a title it set.
+func mergeSettleInfo(si *settleInfo, mirror js.Value) {
+	if tasks := mirror.Get("tasks"); tasks.Truthy() {
+		for i := 0; i < tasks.Length(); i++ {
+			task := tasks.Index(i)
+			si.tasks = append(si.tasks, func() { task.Invoke() })
+		}
+	}
+	if elts := mirror.Get("elts"); elts.Truthy() {
+		for i := len(si.elts); i < elts.Length(); i++ {
+			si.elts = append(si.elts, elts.Index(i))
+		}
+	}
+	if title := mirror.Get("title"); !title.Equal(si.title) {
+		si.title = title
+	}
 }
 
 func oobSwap(oobValue string, oobElement js.Value, si *settleInfo, rootNode js.Value) string {
@@ -1261,8 +1384,11 @@ func swapWithStyle(swapStyle string, elt, target, fragment js.Value, si *settleI
 		textNode := global.Get("Node").Get("TEXT_NODE").Int()
 		commentNode := global.Get("Node").Get("COMMENT_NODE").Int()
 		for _, ext := range getExtensions(elt, nil, nil) {
-			var newElements js.Value
-			handled := !safe(func() { newElements = ext.Call("handleSwap", swapStyle, target, fragment, si) })
+			mirror := jsSettleInfo(si)
+			// A custom extension's handleSwap is arbitrary third-party JS; a throw from
+			// it must leave the swap to fall through to the built-in styles below.
+			newElements, handled := jsTry(ext, "handleSwap", swapStyle, target, fragment, mirror)
+			mergeSettleInfo(si, mirror)
 			if handled && newElements.Truthy() {
 				if newElements.InstanceOf(global.Get("Array")) {
 					for j := 0; j < newElements.Get("length").Int(); j++ {
@@ -1413,7 +1539,10 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 			focusOptions.Set("preventScroll", preventScroll)
 			if newActiveElt.Truthy() {
 				if selStart.Truthy() && newActiveElt.Get("setSelectionRange").Truthy() {
-					safe(func() { newActiveElt.Call("setSelectionRange", selStart, selEnd) })
+					// Throws InvalidStateError on an input type that does not support text
+					// selection (email, number, date, ...); the exact set is per-spec and
+					// per-browser, so let the call itself decide instead of guessing it.
+					jsTry(newActiveElt, "setSelectionRange", selStart, selEnd)
 				}
 				newActiveElt.Call("focus", focusOptions)
 			}
@@ -1468,6 +1597,8 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 	if opts.contextElement.Truthy() {
 		elt = opts.contextElement
 	}
+	// doSwap is Go, not a single JS call, so the JS try/catch bridge cannot wrap it:
+	// this is the one guard whose reach depends on the toolchain implementing recover.
 	threw := safe(func() {
 		if spec.swapDelay > 0 {
 			getWindow().Call("setTimeout", js.FuncOf(func(js.Value, []js.Value) any { doSwap(); return nil }), spec.swapDelay)
@@ -1589,13 +1720,20 @@ func maybeGenerateConditional(elt js.Value, tokens *[]string, paramName string) 
 				}
 				*tokens = (*tokens)[1:]
 				conditionalSource += ")})"
-				var fn js.Value = null
-				threw := safe(func() {
-					fn = maybeEval(elt, func() js.Value {
-						return global.Get("Function").New(conditionalSource).Invoke()
-					}, js.FuncOf(func(js.Value, []js.Value) any { return true }).Value)
-				})
-				if threw {
+				// The source comes from the element's hx-trigger, so both the Function
+				// constructor (syntax error) and the outer invocation can throw.
+				built := true
+				fn := maybeEval(elt, func() js.Value {
+					factory, ok := jsTryNew(global.Get("Function"), conditionalSource)
+					if !ok {
+						built = false
+						return null
+					}
+					filter, ok := jsTry(factory, "call", undefined)
+					built = ok
+					return filter
+				}, js.FuncOf(func(js.Value, []js.Value) any { return true }).Value)
+				if !built {
 					d := newObject()
 					d.Set("source", conditionalSource)
 					triggerErrorEvent(getDocument().Get("body"), "htmx:syntax:error", d)
@@ -1968,9 +2106,9 @@ func ignoreBoostedAnchorCtrlClick(elt, evt js.Value) bool {
 func maybeFilterEvent(spec *triggerSpec, elt, evt js.Value) bool {
 	eventFilter := spec.eventFilter
 	if eventFilter.Truthy() {
-		var result js.Value
-		threw := safe(func() { result = eventFilter.Call("call", elt, evt) })
-		if threw {
+		// The filter body is a user-authored JS expression from hx-trigger.
+		result, ok := jsTry(eventFilter, "call", elt, evt)
+		if !ok {
 			d := newObject()
 			d.Set("source", eventFilter.Get("source"))
 			triggerErrorEvent(getDocument().Get("body"), "htmx:eventFilter:error", d)
@@ -2494,9 +2632,12 @@ func ignoreEventForLogging(eventName string) bool {
 	return eventName == "htmx:afterProcessNode"
 }
 
+// withExtensions runs toDo for every extension registered for elt.
+// Extension methods are third-party JS: toDo must reach them through jsTry so a
+// throwing extension is skipped rather than taking the instance down with it.
 func withExtensions(elt js.Value, toDo func(js.Value)) {
 	for _, extension := range getExtensions(elt, nil, nil) {
-		safe(func() { toDo(extension) })
+		toDo(extension)
 	}
 }
 
@@ -2523,7 +2664,10 @@ func triggerEvent(elt js.Value, eventName string, detail js.Value) bool {
 		eventResult = eventResult && elt.Call("dispatchEvent", kebabedEvent).Bool()
 	}
 	withExtensions(asElement(elt), func(extension js.Value) {
-		res := extension.Call("onEvent", eventName, event)
+		res, ok := jsTry(extension, "onEvent", eventName, event)
+		if !ok {
+			return
+		}
 		// htmx.js tests `extension.onEvent(...) != false`; an extension that
 		// returns nothing yields undefined (here null), and `undefined != false`
 		// is true. Calling .Bool() on a non-boolean would panic, so only treat an
@@ -2595,11 +2739,13 @@ func saveToHistoryCache(url string, rootElt js.Value) {
 		historyCache.Call("shift")
 	}
 	for historyCache.Get("length").Int() > 0 {
-		threw := safe(func() {
-			global.Get("sessionStorage").Call("setItem", "htmx-history-cache", global.Get("JSON").Call("stringify", historyCache))
-		})
-		if !threw {
-			break
+		// Both steps can fail on their own: an htmx:historyItemCreated listener may have
+		// left the cache unserializable, and setItem throws once the quota is exceeded.
+		// Either way the loop drops the oldest entry and retries.
+		if payload, encoded := jsTry(global.Get("JSON"), "stringify", historyCache); encoded {
+			if _, stored := jsTry(global.Get("sessionStorage"), "setItem", "htmx-history-cache", payload); stored {
+				break
+			}
 		}
 		ce := newObject()
 		ce.Set("cache", historyCache)
@@ -3182,7 +3328,9 @@ func encodeParamsForBody(xhr, elt, filteredParameters js.Value) js.Value {
 	var encoded js.Value = null
 	withExtensions(elt, func(extension js.Value) {
 		if !encoded.Truthy() {
-			encoded = extension.Call("encodeParameters", xhr, filteredParameters, elt)
+			if v, ok := jsTry(extension, "encodeParameters", xhr, filteredParameters, elt); ok {
+				encoded = v
+			}
 		}
 	})
 	if encoded.Truthy() {
@@ -3328,26 +3476,35 @@ func safelySetHeaderValue(xhr js.Value, header string, headerValue js.Value) {
 	if headerValue.Type() == js.TypeNull {
 		return
 	}
-	threw := safe(func() { xhr.Call("setRequestHeader", header, headerValue) })
-	if threw {
-		xhr.Call("setRequestHeader", header, global.Get("encodeURIComponent").Invoke(headerValue))
-		xhr.Call("setRequestHeader", header+"-URI-AutoEncoded", "true")
+	// setRequestHeader rejects a value with characters outside the HTTP field grammar;
+	// the retry sends it URI-encoded. A value that survives neither form is dropped,
+	// since letting the second throw propagate would take the whole request path down.
+	if _, ok := jsTry(xhr, "setRequestHeader", header, headerValue); ok {
+		return
 	}
+	encoded, ok := jsTry(global, "encodeURIComponent", headerValue)
+	if !ok {
+		logError("htmx: unencodable header value dropped: " + header)
+		return
+	}
+	if _, ok := jsTry(xhr, "setRequestHeader", header, encoded); !ok {
+		logError("htmx: rejected header dropped: " + header)
+		return
+	}
+	jsTry(xhr, "setRequestHeader", header+"-URI-AutoEncoded", "true")
 }
 
 func getPathFromResponse(xhr js.Value) string {
 	if xhr.Get("responseURL").Truthy() {
-		var out string
-		threw := safe(func() {
-			url := global.Get("URL").New(xhr.Get("responseURL"))
-			out = url.Get("pathname").String() + url.Get("search").String()
-		})
-		if threw {
+		// new URL rejects a malformed responseURL.
+		url, ok := jsTryNew(global.Get("URL"), xhr.Get("responseURL"))
+		if !ok {
 			d := newObject()
 			d.Set("url", xhr.Get("responseURL"))
 			triggerErrorEvent(getDocument().Get("body"), "htmx:badResponseUrl", d)
+			return ""
 		}
-		return out
+		return url.Get("pathname").String() + url.Get("search").String()
 	}
 	return ""
 }
@@ -3987,6 +4144,9 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 	var indicators, disableElts []js.Value
 
 	xhr.Set("onload", js.FuncOf(func(js.Value, []js.Value) any {
+		// The whole response-handling pass is Go, not a single JS call, so the JS
+		// try/catch bridge cannot wrap it: this guard's reach depends on the toolchain
+		// implementing recover.
 		threw := safe(func() {
 			hierarchy := hierarchyForElt(elt)
 			pathInfo.Set("responsePath", getPathFromResponse(xhr))
@@ -4345,7 +4505,9 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 			cancelPolling(elt)
 		}
 		withExtensions(elt, func(extension js.Value) {
-			serverResponse = jstr(extension.Call("transformResponse", serverResponse, xhr, elt))
+			if v, ok := jsTry(extension, "transformResponse", serverResponse, xhr, elt); ok {
+				serverResponse = jstr(v)
+			}
 		})
 		if historyUpd.updateType != "" {
 			saveCurrentPageToHistory()
@@ -4809,6 +4971,11 @@ func Install() {
 	hxOnXPath = global.Get("XPathEvaluator").New().Call("createExpression",
 		`.//*[@*[ starts-with(name(), "hx-on:") or starts-with(name(), "data-hx-on:") or`+
 			` starts-with(name(), "hx-on-") or starts-with(name(), "data-hx-on-") ]]`)
+
+	// A WASM host installs asynchronously and can arrive after DOMContentLoaded, which the listener below would then never catch; readyState is "loading" only while the parser runs, so anything else proves the document is parsed and ready() must not park work on an event that cannot fire again.
+	if getDocument().Get("readyState").String() != "loading" {
+		isReady = true
+	}
 
 	getDocument().Call("addEventListener", "DOMContentLoaded", js.FuncOf(func(js.Value, []js.Value) any {
 		isReady = true
