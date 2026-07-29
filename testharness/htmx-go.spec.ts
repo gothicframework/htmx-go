@@ -6,8 +6,8 @@ import { test, expect, Page } from "@playwright/test";
 // This spec asserts the compiled Go/WASM port of htmx v2.0.9 against the live DOM
 // fixtures in index.html + the fragment endpoints in server/main.go. It is a
 // VALIDATION spec: it does NOT patch htmx.go. Where the port diverges from
-// upstream htmx, the divergence is captured as a real, failing assertion so
-// Phase 2 has a red test to turn green — never a skip.
+// upstream htmx, the divergence is captured as a real, failing assertion —
+// never a skip.
 //
 // Design rules:
 //   • Every behaviour is asserted on its own OBSERVABLE outcome — the DOM
