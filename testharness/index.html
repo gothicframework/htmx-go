@@ -41,7 +41,7 @@
 
   <!-- ───────────────────────── hx-post form (echo body) ───────────────────────── -->
   <section>
-    <h2>hx-post form — body echo + configRequest header mutation</h2>
+    <h2>hx-post form — body echo + htmx:config:request header mutation</h2>
     <form id="echo-form" data-testid="echo-form"
           hx-post="/echo" hx-target="#echo-out" hx-swap="innerHTML">
       <input type="text" name="alpha" value="one">
@@ -185,8 +185,8 @@
 
   <script src="wasm_exec.js"></script>
   <script>
-    // ── configRequest listener: proves detail.headers are mutable by third-party
-    //    listeners (the downstream AWS request signer contract). Registered on
+    // ── htmx:config:request listener: proves detail.headers are mutable by
+    //    third-party listeners (the downstream AWS request signer contract). Registered on
     //    document as a plain bubbling-event listener so it works no matter when
     //    htmx boots. The /echo endpoint reflects the injected header back so the
     //    spec can assert it round-tripped. This fires on EVERY htmx request,
@@ -200,7 +200,7 @@
     //    htmx.js the same path is a harmless `undefined`. So this always-on
     //    listener deliberately does NOT set a string parameter. A targeted QA
     //    test can reproduce the panic in isolation (see the harness report).
-    document.addEventListener("htmx:configRequest", function (evt) {
+    document.addEventListener("htmx:config:request", function (evt) {
       evt.detail.headers["X-Gothic-Test"] = "signed";
     });
 

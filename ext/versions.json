@@ -2,7 +2,7 @@
   "$comment": "Single source of truth for the upstream versions this repo's ports track. Bumping a port means updating BOTH the code (htmx.go Version const / ext/preload header) AND the matching 'pinned' value here. The scheduled upstream-watch GitHub Action reads this file and notifies (issue-only) when an upstream moves ahead of a pin. It never auto-updates.",
   "htmx": {
     "repo": "bigskysoftware/htmx",
-    "pinned": "2.0.9",
+    "pinned": "4.0.0",
     "code": "htmx.go (const Version)",
     "method": "GitHub releases/latest tag_name"
   },

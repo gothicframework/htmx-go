@@ -13,7 +13,7 @@ import { test, expect, Page } from "@playwright/test";
 //     ZERO console errors.
 //
 //   Cluster B — htmx.on / htmx.trigger event dispatch. A custom event registered
-//     via the public API must be received; htmx:afterSwap must fire and a listener
+//     via the public API must be received; htmx:after:swap must fire and a listener
 //     must observe it after a real swap.
 //
 //   Cluster C — parseJSON("") logged `htmx: invalid JSON` to console.error on the
@@ -172,13 +172,13 @@ test.describe("Cluster B — htmx.on / htmx.trigger event dispatch", () => {
     expect(errors, errors.join("\n")).toHaveLength(0);
   });
 
-  test("htmx:afterSwap fires and a listener count increments after a swap", async ({
+  test("htmx:after:swap fires and a listener count increments after a swap", async ({
     page,
   }) => {
     const errors = await boot(page);
     await page.evaluate(() => {
       (window as any).__afterSwap = 0;
-      (window as any).htmx.on("htmx:afterSwap", () => {
+      (window as any).htmx.on("htmx:after:swap", () => {
         (window as any).__afterSwap++;
       });
       const host = document.createElement("div");

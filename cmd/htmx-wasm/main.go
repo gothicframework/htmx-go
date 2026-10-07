@@ -7,7 +7,7 @@
 // installed event handlers stay alive.
 package main
 
-import htmx "github.com/gothicframework/htmx-go/v2"
+import htmx "github.com/gothicframework/htmx-go/v4"
 
 func main() {
 	htmx.Boot()

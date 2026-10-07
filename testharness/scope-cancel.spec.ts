@@ -28,10 +28,10 @@ async function bootReady(page: import("@playwright/test").Page) {
       const elt = (d && d.elt) || (e.target as Element);
       return (elt && (elt as Element).id) || "";
     };
-    document.addEventListener("htmx:beforeRequest", (e) => w.__evt.beforeReq.push(idOf(e)));
+    document.addEventListener("htmx:before:request", (e) => w.__evt.beforeReq.push(idOf(e)));
     document.addEventListener("htmx:abort", (e) => w.__evt.abort.push(idOf(e)));
-    document.addEventListener("htmx:sendAbort", (e) => w.__evt.sendAbort.push(idOf(e)));
-    document.addEventListener("htmx:afterSwap", (e) => w.__evt.afterSwap.push(idOf(e)));
+    document.addEventListener("htmx:finally:request", (e) => w.__evt.sendAbort.push(idOf(e)));
+    document.addEventListener("htmx:after:swap", (e) => w.__evt.afterSwap.push(idOf(e)));
   });
 
   await page.goto("/");
@@ -87,7 +87,7 @@ test("aborts an in-flight request when its scope subtree is swapped out", async 
 
   // …and its in-flight request must have been aborted via htmx's own path:
   // htmx:abort re-fired on the element, and the XHR's onabort handler ran
-  // (htmx:sendAbort). Both keyed to the issuing element id.
+  // (htmx:finally:request). Both keyed to the issuing element id.
   await expect
     .poll(() => page.evaluate(() => (window as any).__evt.abort.includes("scoped-slow")))
     .toBe(true);
@@ -127,11 +127,10 @@ test("does NOT abort a request that completes normally (no teardown)", async ({ 
   // The request completes and swaps its payload into the (still-attached) sink.
   await expect(page.locator("#scoped-slow-out")).toContainText("slow-ok", { timeout: 5_000 });
 
-  // No abort of any kind fired for it.
+  // No abort of any kind fired for it (v4 folds completion signals into
+  // htmx:finally:request; only htmx:abort means an abort).
   const aborted = await page.evaluate(
-    () =>
-      (window as any).__evt.abort.includes("scoped-slow") ||
-      (window as any).__evt.sendAbort.includes("scoped-slow"),
+    () => (window as any).__evt.abort.includes("scoped-slow"),
   );
   expect(aborted).toBe(false);
 });

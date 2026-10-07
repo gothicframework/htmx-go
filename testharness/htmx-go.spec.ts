@@ -1,9 +1,9 @@
 import { test, expect, Page } from "@playwright/test";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// htmx-go WASM port — behavioural assertion spec (Phase-1 validation artifact).
+// htmx-go WASM port — behavioural assertion spec.
 //
-// This spec asserts the compiled Go/WASM port of htmx v2.0.9 against the live DOM
+// This spec asserts the compiled Go/WASM port of htmx v4.0.0 against the live DOM
 // fixtures in index.html + the fragment endpoints in server/main.go. It is a
 // VALIDATION spec: it does NOT patch htmx.go. Where the port diverges from
 // upstream htmx, the divergence is captured as a real, failing assertion —
@@ -49,10 +49,10 @@ test.describe("install + identity", () => {
     expect(type).toBe("object");
   });
 
-  test("htmx.version === 2.0.9", async ({ page }) => {
+  test("htmx.version === 4.0.0", async ({ page }) => {
     await gotoReady(page);
     const version = await page.evaluate(() => (window as any).htmx?.version);
-    expect(version).toBe("2.0.9");
+    expect(version).toBe("4.0.0");
   });
 });
 
@@ -83,13 +83,13 @@ test.describe("basic requests", () => {
 
 // ── configRequest signer contract: headers AND parameters must be mutable ──────
 
-test.describe("htmx:configRequest signer contract", () => {
+test.describe("htmx:config:request signer contract", () => {
   test("configRequest event fires on a request", async ({ page }) => {
     await gotoReady(page);
     await page.evaluate(() => {
       const w = window as any;
       w.__configReqCount = 0;
-      document.addEventListener("htmx:configRequest", () => w.__configReqCount++);
+      document.addEventListener("htmx:config:request", () => w.__configReqCount++);
     });
     await page.getByTestId("get-basic").click();
     await expect
@@ -111,7 +111,7 @@ test.describe("htmx:configRequest signer contract", () => {
   });
 
   // Signer contract: assigning a STRING to detail.parameters[key] in a
-  // htmx:configRequest listener must append the value to the sent body. The
+  // htmx:config:request listener must append the value to the sent body. The
   // formData `set` proxy trap now type-checks the value before probing
   // `.forEach`, so a plain string appends (matching upstream htmx.js) instead of
   // panicking the WASM runtime. A signer that adds a signature PARAMETER (not
@@ -122,7 +122,7 @@ test.describe("htmx:configRequest signer contract", () => {
     const errs = captureErrors(page);
     await gotoReady(page);
     await page.evaluate(() => {
-      document.addEventListener("htmx:configRequest", (evt: any) => {
+      document.addEventListener("htmx:config:request", (evt: any) => {
         // Signer contract: add a signature PARAMETER (a plain string value).
         evt.detail.parameters["signature"] = "sig-abc123";
       });
@@ -143,7 +143,7 @@ test.describe("htmx:configRequest signer contract", () => {
 // via htmx.RegisterTransformer BETWEEN htmx.Install() and htmx.Start():
 //   • two append to the X-Transform-Order header ("1" then "2"),
 //   • one sets a signature parameter (xform-sig=sig-from-transformer).
-// They run inside issueAjaxRequest after htmx:configRequest resolves and before
+// They run inside issueAjaxRequest after htmx:config:request resolves and before
 // xhr.send, so their mutations reach the wire. /echo reflects both back. This is
 // the seam the AWS SigV4 signer will hook into (Go-native, not the JS detail).
 test.describe("RequestTransformer seam", () => {
@@ -502,8 +502,8 @@ test.describe("request lifecycle events", () => {
   // keepIndicators is guarded now. On a normal response `keepIndicators` is
   // undefined; the guard treats missing as false (mirroring htmx.js's
   // `!responseInfo.keepIndicators`) instead of panicking on .Bool(). So the
-  // post-swap tail runs: removeRequestIndicators, htmx:afterRequest and
-  // htmx:afterOnLoad fire, and htmx:onLoadError does NOT fire on a healthy
+  // post-swap tail runs: removeRequestIndicators, htmx:after:request and
+  // htmx:after:request fire, and htmx:error does NOT fire on a healthy
   // response. This asserts that upstream lifecycle.
   test("afterRequest + afterOnLoad fire and onLoadError does not", async ({
     page,
@@ -512,29 +512,29 @@ test.describe("request lifecycle events", () => {
     await page.evaluate(() => {
       const w = window as any;
       w.__life = { afterRequest: 0, afterOnLoad: 0, onLoadError: 0 };
-      document.addEventListener("htmx:afterRequest", () => w.__life.afterRequest++);
-      document.addEventListener("htmx:afterOnLoad", () => w.__life.afterOnLoad++);
-      document.addEventListener("htmx:onLoadError", () => w.__life.onLoadError++);
+      document.addEventListener("htmx:after:request", () => w.__life.afterRequest++);
+      document.addEventListener("htmx:after:request", () => w.__life.afterOnLoad++);
+      document.addEventListener("htmx:error", () => w.__life.onLoadError++);
     });
     await page.getByTestId("get-basic").click();
     // The swap itself lands regardless (asserted elsewhere); here we require the
     // healthy post-swap tail.
     await expect(page.getByTestId("get-out")).toContainText(FRAGMENT_TEXT);
     const life = await page.evaluate(() => (window as any).__life);
-    expect(life.afterRequest, "htmx:afterRequest fired").toBeGreaterThan(0);
-    expect(life.afterOnLoad, "htmx:afterOnLoad fired").toBeGreaterThan(0);
-    expect(life.onLoadError, "htmx:onLoadError did NOT fire").toBe(0);
+    expect(life.afterRequest, "htmx:after:request fired").toBeGreaterThan(0);
+    expect(life.afterOnLoad, "htmx:after:request fired").toBeGreaterThan(0);
+    expect(life.onLoadError, "htmx:error did NOT fire").toBe(0);
   });
 
-  // Regression guard: a normal response must NOT emit htmx:onLoadError (the
+  // Regression guard: a normal response must NOT emit htmx:error (the
   // keepIndicators panic used to force it). This is the inverse of the retired
   // "current defect" companion and pins the fix.
-  test("a normal response does not emit htmx:onLoadError", async ({ page }) => {
+  test("a normal response does not emit htmx:error", async ({ page }) => {
     await gotoReady(page);
     await page.evaluate(() => {
       const w = window as any;
       w.__onLoadError = 0;
-      document.addEventListener("htmx:onLoadError", () => w.__onLoadError++);
+      document.addEventListener("htmx:error", () => w.__onLoadError++);
     });
     await page.getByTestId("get-basic").click();
     await expect(page.getByTestId("get-out")).toContainText(FRAGMENT_TEXT);

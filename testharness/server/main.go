@@ -14,7 +14,7 @@
 //
 //	/fragment        a plain swap payload with a stable testid
 //	/echo            reflects method + urlencoded body + the X-Gothic-Test header
-//	                 (which a htmx:configRequest listener injects) so the round trip
+//	                 (which a htmx:config:request listener injects) so the round trip
 //	                 of the header/parameter-mutation contract is observable
 //	/oob             primary payload + an hx-swap-oob="true" element for #oob-target
 //	/tick            monotonically increasing counter, for `every 1s` polling
@@ -125,6 +125,38 @@ func main() {
 			`<button data-testid="script-nested" hx-get="/fragment" hx-target="#script-nested-out" hx-swap="innerHTML">nested</button>`+
 			`<div id="script-nested-out" data-testid="script-nested-out">nested empty</div>`+
 			`<script>window.__scriptFragmentRan = true;</script>`)
+	})
+
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		// Status-code driven fixtures: ?code=<n> returns that status with a
+		// swap payload, for hx-status:<pattern> override assertions.
+		code := 200
+		if c := r.URL.Query().Get("code"); c != "" {
+			if n, err := strconv.Atoi(c); err == nil {
+				code = n
+			}
+		}
+		w.WriteHeader(code)
+		writeHTML(w, `<span data-testid="status-payload">status-ok</span>`)
+	})
+
+	mux.HandleFunc("/wrapper", func(w http.ResponseWriter, r *http.Request) {
+		// A wrapped payload for outerSync / boost-HCON-target assertions.
+		writeHTML(w, `<div id="wrapper-payload-id" class="adopted-class" data-testid="wrapper-payload">`+
+			`<span data-testid="wrapped-text">wrapped-ok</span></div>`)
+	})
+
+	mux.HandleFunc("/morph-inner", func(w http.ResponseWriter, r *http.Request) {
+		// Same-id span as the morph-inner fixture: innerMorph must patch it in
+		// place rather than destroy the (id-carrying) node.
+		writeHTML(w, `<span data-testid="morph-span" id="morph-span">morph-inner-new</span>`)
+	})
+
+	mux.HandleFunc("/morph-outer", func(w http.ResponseWriter, r *http.Request) {
+		// Same-id div as the outerMorph fixture: the id-carrying target must be
+		// morphed (patched, node kept) rather than replaced wholesale.
+		writeHTML(w, `<div id="morph-target" class="fresh-class" data-testid="morph-target">`+
+			`<span data-testid="morph-outer-text">morph-outer-new</span></div>`)
 	})
 
 	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {

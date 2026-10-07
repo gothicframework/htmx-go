@@ -78,17 +78,17 @@ test("htmx.trigger detail round-trips to a document-level htmx.on listener", asy
   expect(result.detail).toEqual({ a: "x", n: 42 });
 });
 
-test("2-arg htmx.on receives a real bubbling htmx:afterSwap event from htmx.swap", async ({
+test("2-arg htmx.on receives a real bubbling htmx:after:swap event from htmx.swap", async ({
   page,
 }) => {
   await boot(page);
   const result = await page.evaluate(() => {
     return new Promise<any>((resolve) => {
       let fired = 0;
-      (window as any).htmx.on("htmx:afterSwap", () => {
+      (window as any).htmx.on("htmx:after:swap", () => {
         fired++;
       });
-      // htmx.swap fires htmx:afterSwap on the target; it must bubble to document.
+      // htmx.swap fires htmx:after:swap on the target; it must bubble to document.
       (window as any).htmx.swap(
         "#get-out",
         "<span id='swapped-marker'>x</span>",

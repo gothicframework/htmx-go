@@ -14,8 +14,8 @@
 package main
 
 import (
-	htmx "github.com/gothicframework/htmx-go/v2"
-	"github.com/gothicframework/htmx-go/v2/ext/preload"
+	htmx "github.com/gothicframework/htmx-go/v4"
+	"github.com/gothicframework/htmx-go/v4/ext/preload"
 )
 
 func main() {

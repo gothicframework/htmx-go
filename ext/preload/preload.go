@@ -47,8 +47,8 @@ func Register() {
 }
 
 func onEvent(_ js.Value, args []js.Value) any {
-	// Only take action on htmx:afterProcessNode.
-	if args[0].String() != "htmx:afterProcessNode" {
+	// Only take action on htmx:after:init.
+	if args[0].String() != "htmx:after:init" {
 		return nil
 	}
 	event := args[1]

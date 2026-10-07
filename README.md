@@ -6,7 +6,7 @@ Framework org. It reimplements htmx's client runtime in Go (compiled to
 `window.htmx` from inside the same WASM binary. Gothic's **core** module embeds it,
 giving Gothic apps a full htmx client without loading a separate JS file.
 
-This tree mirrors **htmx v2.0.9**.
+This tree mirrors **htmx v4.0.0**.
 
 ## Versioning — tracks upstream htmx
 
@@ -14,12 +14,11 @@ The module version follows htmx's version, not Gothic's:
 
 | htmx | module path | example tag |
 |------|-------------|-------------|
-| 2.x  | `github.com/gothicframework/htmx-go/v2` | `v2.0.9` |
 | 4.x  | `github.com/gothicframework/htmx-go/v4` | `v4.0.0` |
 
 - The Go **major-version suffix** (`/v2`, `/v4`) mirrors htmx's major version.
-- Semver tags mirror upstream htmx releases (this is `v2.0.9`).
-- `htmx.version` reported on `window` is the upstream string (`2.0.9`), so JS
+- Semver tags mirror upstream htmx releases (this is `v4.0.0`).
+- `htmx.version` reported on `window` is the upstream string (`4.0.0`), so JS
   tooling and extensions see the real version.
 
 When htmx ships an update, we ship the matching Go mirror.
@@ -34,7 +33,7 @@ runtime) boots it from a `js/wasm` main:
 
 package main
 
-import htmx "github.com/gothicframework/htmx-go/v2"
+import htmx "github.com/gothicframework/htmx-go/v4"
 
 func main() {
 	htmx.Boot()  // installs window.htmx and processes document.body
@@ -77,7 +76,7 @@ This ordering matters: an in-path signer or a preload extension registered *afte
 
 htmx-go exposes an **in-path request seam** that upstream htmx has no equivalent for.
 A `RequestTransformer` is a Go function run **inside** the request pipeline — after
-`htmx:configRequest`, immediately before `xhr.send` — so it can rewrite the outgoing
+`htmx:config:request`, immediately before `xhr.send` — so it can rewrite the outgoing
 request with no boot race and no dependence on a JS event listener firing first.
 
 ```go
@@ -108,14 +107,14 @@ htmx.RegisterTransformer(func(req *htmx.TransformableRequest) {
 })
 ```
 
-Because it runs as a line in the request path rather than as a `htmx:configRequest`
-event listener, a transformer is guaranteed to see **every** request — including the
+Because it runs as a line in the request path rather than as an
+`htmx:config:request` event listener, a transformer is guaranteed to see **every** request — including the
 first one fired by the initial DOM pass — with no ordering caveats. `ext/sigv4` builds
 on this to sign requests safely.
 
 ## What this is
 
-`htmx.go` is a **direct, function-by-function translation** of `htmx.js` (v2.0.9)
+`htmx.go` is a **direct, function-by-function translation** of `htmx.js` (v4.0.0)
 — not a reimplementation. Function names mirror the originals (`processNode`,
 `getTriggerSpecs`, `issueAjaxRequest`, `swapWithStyle`, `handleAjaxResponse`,
 `getInputValues`, …) so the two files diff side by side, and the same runtime
@@ -125,8 +124,8 @@ machinery is preserved:
   Go-side so it can hold timers, listener records, and closures.
 - **`XMLHttpRequest`** request cycle (not `fetch`) — including `hx-sync` queue
   strategies (`drop`/`abort`/`replace`/`queue`), `hx-confirm`/`hx-prompt`,
-  indicators, `hx-disabled-elt`, and the full `htmx:configRequest` →
-  `beforeSend` → `onload`/`onerror`/`onabort`/`ontimeout` lifecycle.
+  indicators, `hx-disabled-elt`, and the full `htmx:config:request` →
+  `before:send`-stage → `onload`/`onerror`/`onabort`/`ontimeout` lifecycle.
 - The **trigger tokenizer** (`tokenizeString` / `consumeCSSSelector` /
   `parseAndCacheTrigger`) with every modifier: `delay`, `throttle`, `once`,
   `changed`, `from`, `target`, `consume`, `queue`, `root`, `threshold`, plus
@@ -165,6 +164,26 @@ copy; all are behaviour-preserving:
 - **eval-dependent features** run through `Function`/`eval` (see above) rather
   than a Go expression evaluator.
 
+## 4.0 divergences
+
+The port adopts upstream htmx 4.0 selectively: where a v4 rename or removal would
+have broken Gothic's v2-era surface, the v2 behaviour is kept. Divergences, each
+verifiable against the reference `htmx.js` checked into this repo:
+
+- **XMLHttpRequest stays the transport.** Upstream 4.0 dropped the XHR cycle for
+  `fetch` — losing `hx-sync` queue strategies, XHR progress/timeout semantics and
+  the abort path Gothic's scope-tied cancellation reuses. The port keeps
+  `XMLHttpRequest`.
+- **Attribute inheritance keeps the v2 model.** Upstream 4.0 replaced
+  `hx-disinherit`/`hx-inherit` with the `…:inherited` attribute-suffix scheme and
+  its `implicitInheritance` config; the port keeps `hx-disinherit`/`hx-inherit`.
+- **`hx-disable`/`[data-hx-disable]` keep the v2 spelling** (the port's
+  `disableSelector` config value); upstream 4.0 normalised on `[hx-ignore]-`
+  based guarding, which the port does not adopt.
+- **`hx-vars` and `hx-params` are still honored** — removed upstream in 4.0 —
+  because v2-era user layouts continue to use them.
+- **Config keys keep the v2 names** where 4.0 renamed them (e.g. `disableSelector`).
+
 ## Testing
 
 Two layers of browser tests cover the port against a live DOM:
@@ -172,11 +191,9 @@ Two layers of browser tests cover the port against a live DOM:
 - **`testharness/`** — a Playwright harness that loads `htmx.wasm` + `wasm_exec.js`
   in a real page and exercises request/swap/history/trigger behaviour, the
   `RequestTransformer` seam, `ext/sigv4`, scope-tied cancellation, and the Topic
-  bridge (≈60 browser tests across the spec files).
+  bridge (~78 browser tests across the spec files, v4 and legacy surface).
 - **The Gothic e2e Playwright gate** runs the whole framework — with htmx supplied
-  by `core.wasm` — end to end (~193 of 198 passing). The one non-passing case is an
-  unrelated TinyGo 0.41.1 runtime issue (a `SetFinalizer` leak, fixed upstream by a
-  pending TinyGo release), not an htmx-go or Gothic bug.
+  by `core.wasm` — end to end (191/191 chromium at the time of writing).
 
 ## Extensions (`ext/`)
 
@@ -192,15 +209,18 @@ beside it for diffing. Two mechanisms:
 
 | Extension | Upstream | Mechanism | Marginal size |
 |---|---|---|---|
-| `ext/preload` | `htmx-ext-preload` v2.0.1 | extension (`defineExtension`) | +3.5 KB brotli |
+| `ext/preload` | `htmx-ext-preload` v2.0.1 (upstream's current code has been rewritten for htmx 4.0; this port keeps the pre-4.0 reference and re-ports on drift) | extension (`defineExtension`) | +3.5 KB brotli |
 | `ext/sigv4` | (Gothic's AWS SigV4 signer) | in-path `RequestTransformer` | small |
 
 Because htmx-go installs a real `window.htmx` (with `defineExtension`), **users can
 still load any third-party htmx extension as a normal JS `<script>`** — the Go
-`ext/` ports are just the ones Gothic ships built-in.
+`ext/` ports are just the ones Gothic ships built-in. Upstream's other extensions
+(`hx-sse`, `hx-ws`, `hx-multipart`) have no Go port here: load them as their
+upstream `<script>` — they attach to the installed `window.htmx` the same way they
+would against the JS build.
 
 **`ext/sigv4`** signs requests with `x-amz-content-sha256` as an in-path
-`RequestTransformer` (after `htmx:configRequest`, before `xhr.send`) — it hashes the
+`RequestTransformer` (after `htmx:config:request`, before `xhr.send`) — it hashes the
 exact body htmx would send. It is gated by a **runtime** signal, not a build flag:
 the same committed `core.wasm` serves every app, so `Register()` reads the
 server-rendered `<meta name="gothic-provider" content="AWS">` marker and installs the
@@ -219,14 +239,14 @@ htmx-go exposes seams that Gothic core wires into deeper runtime behaviour:
 
 - **Scope-tied request cancellation.** When a Gothic stateful component unmounts, any
   in-flight htmx XHR it owns is aborted. This reuses htmx's own `htmx:abort` via a
-  single delegated `htmx:beforeCleanupElement` listener — no bespoke cancellation
+  single delegated `htmx:before:cleanup` listener — no bespoke cancellation
   machinery, just htmx's existing abort path tied to the component scope.
 - **Topic ⇄ htmx bridge** (`RegisterTriggerAlias`). A trigger or publish name that
   begins with a registered prefix is rewritten to a host bus event:
   - `hx-trigger="topic:<name>"` fires when a Gothic Topic publishes `<name>` — the
     alias rewrites `topic:<name>` to the host event (e.g. `gothic:topic:<name>`) and,
     absent an explicit `from:`, binds the listener where the bus dispatches.
-  - `hx-publish="topic:<name>"` publishes to that Topic on `htmx:afterSwap` — a single
+  - `hx-publish="topic:<name>"` publishes to that Topic on `htmx:after:swap` — a single
     delegated `body` listener dispatches the rewritten event after any swap.
   - `RegisterTriggerAlias(prefix, eventPrefix, defaultFrom)` registers the mapping and
     is also exposed as `htmx.registerTriggerAlias` on `window`. Call it before
@@ -239,7 +259,7 @@ It records, per port, the upstream repo and the pinned version:
 
 | Port | Upstream | Pinned | Where the code says so |
 |---|---|---|---|
-| `htmx` | `bigskysoftware/htmx` (release) | `2.0.9` | `htmx.go` `const Version` |
+| `htmx` | `bigskysoftware/htmx` (release) | `4.0.0` | `htmx.go` `const Version` |
 | `preload` | `bigskysoftware/htmx-extensions` → `src/preload/package.json` | `2.0.1` | `ext/preload/preload.go` header |
 | `sigv4` | (Gothic-original — no upstream package) | `n/a` | `ext/sigv4/` |
 
@@ -266,9 +286,9 @@ it never opens a PR and never edits a pin. Run the detector locally with
 
 ```
 htmx-go/
-├── go.mod                 # module .../htmx-go/v2, tracks htmx 2.x
+├── go.mod                 # module .../htmx-go/v4, tracks htmx 4.x
 ├── htmx.go                # the Go/WASM port (~4.9k lines, package htmx)
-├── htmx.js                # upstream source this mirrors (v2.0.9), for diffing
+├── htmx.js                # upstream source this mirrors (v4.0.0), for diffing
 ├── transformer.go         # the in-path RequestTransformer seam
 ├── cmd/htmx-wasm/         # standalone build entrypoint
 ├── testharness/           # Playwright browser-validation harness (+ built .wasm)

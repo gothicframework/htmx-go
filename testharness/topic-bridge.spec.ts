@@ -106,7 +106,7 @@ test("Bridge 2: hx-publish dispatches the aliased topic event after a swap", asy
         fired = true;
       });
 
-      // A swap into #b2-pub fires htmx:afterSwap on it; the delegated hx-publish
+      // A swap into #b2-pub fires htmx:after:swap on it; the delegated hx-publish
       // listener rewrites "topic:chain" → "gothic:topic:chain" and dispatches it.
       (window as any).htmx.swap("#b2-pub", "<span>updated</span>", {
         swapStyle: "innerHTML",

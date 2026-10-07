@@ -6,7 +6,7 @@ import (
 	"strings"
 	"syscall/js"
 
-	htmx "github.com/gothicframework/htmx-go/v2"
+	htmx "github.com/gothicframework/htmx-go/v4"
 )
 
 // providerMetaSelector locates the server-rendered provider marker in the parsed
@@ -34,7 +34,7 @@ const awsProvider = "AWS"
 // anything — making an unsigned-vs-signed mistake impossible by control flow
 // rather than by a timing shim.
 //
-// When enabled, the transformer runs in-path (after htmx:configRequest, before
+// When enabled, the transformer runs in-path (after htmx:config:request, before
 // xhr.send), reproduces htmx's exact body, and sets
 // x-amz-content-sha256 = sha256hex(body). Because it is a line in the request
 // path — not a racing JS listener — emitting an unsigned request is impossible by

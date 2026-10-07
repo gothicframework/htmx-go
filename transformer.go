@@ -4,18 +4,19 @@ package htmx
 
 import "syscall/js"
 
-// RequestTransformer mutates an in-flight htmx request after the
-// htmx:configRequest event has resolved and immediately before the XHR is sent.
-// It is the Go-native counterpart of a htmx:configRequest listener: a
-// transformer sees the FINAL verb, path, headers, and parameters, and any
-// mutation it makes reaches the wire.
+// RequestTransformer mutates an in-flight htmx request at the point where htmx
+// finalizes the request — after the request configuration has been settled and
+// immediately before the XHR is sent. It is the Go-native counterpart of a JS
+// request-configuration listener: a transformer sees the FINAL verb, path,
+// headers, and parameters, and any mutation it makes reaches the wire.
 //
 // Transformers are the seam that downstream request signers hook into. An AWS
 // SigV4 signer, for example, needs to read the final parameters/body and set an
 // authorization header (x-amz-content-sha256, Authorization, …). Unlike a JS
-// htmx:configRequest listener, a transformer is pure Go — no round-trip through
-// the JS `detail` object — so an extension such as ext/sigv4 can reimplement the
-// AWS signer against this type rather than against the JS event detail.
+// request-configuration listener, a transformer is pure Go — no round-trip
+// through the JS `detail` object — so an extension such as ext/sigv4 can
+// reimplement the AWS signer against this type rather than against the JS event
+// detail.
 //
 // Transformers run in registration order (see RegisterTransformer); a later
 // transformer sees the mutations of the earlier ones.
@@ -87,7 +88,7 @@ func (r *TransformableRequest) Element() js.Value { return r.elt }
 var requestTransformers []RequestTransformer
 
 // RegisterTransformer appends a RequestTransformer to the registry. Transformers
-// run in registration order inside issueAjaxRequest, after htmx:configRequest
+// run in registration order inside issueAjaxRequest, after htmx:config:request
 // resolves and before the XHR is sent. Register between htmx.Install() and
 // htmx.Start() (or any time before requests are issued).
 func RegisterTransformer(t RequestTransformer) {

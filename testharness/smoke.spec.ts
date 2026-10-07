@@ -8,14 +8,14 @@ import { test, expect } from "@playwright/test";
 //      (i.e. up to and including the moment window.htmx is installed / ready is
 //      signalled — which happens synchronously at the end of htmx.Boot(), before
 //      any XHR onload can fire),
-//   4. the only post-ready console errors, if any, are the known htmx:onLoadError
+//   4. the only post-ready console errors, if any, are the known htmx:error
 //      runtime defect (see the harness README / report) — a new/unexpected error
 //      class fails the smoke test.
 //
 // Why the "at ready" distinction matters: the boot-time `load` and `every`
 // triggers dispatch requests during processNode, but their onload callbacks run
 // on later ticks. Those callbacks currently hit a port defect (js.Value.Bool on
-// an undefined `keepIndicators`, htmx.go:3853) and emit htmx:onLoadError AFTER
+// an undefined `keepIndicators`, htmx.go:3853) and emit htmx:error AFTER
 // the swap has already landed. That is a Go/WASM port bug for a later phase, not
 // an instantiation failure — so we pin instantiation cleanliness precisely.
 test("harness boots htmx.wasm with a clean instantiation", async ({ page }) => {
@@ -53,7 +53,7 @@ test("harness boots htmx.wasm with a clean instantiation", async ({ page }) => {
 
   // window.htmx installed and reporting the upstream version.
   const version = await page.evaluate(() => (window as any).htmx?.version);
-  expect(version).toBe("2.0.9");
+  expect(version).toBe("4.0.0");
   const htmxType = await page.evaluate(() => typeof (window as any).htmx);
   expect(htmxType).toBe("object");
 
@@ -65,9 +65,9 @@ test("harness boots htmx.wasm with a clean instantiation", async ({ page }) => {
   expect(pageErrors, `pageerrors:\n${pageErrors.join("\n")}`).toEqual([]);
 
   // Give the boot-time load/every triggers a moment to complete, then confirm the
-  // only console errors that appeared are the documented htmx:onLoadError defect —
+  // only console errors that appeared are the documented htmx:error defect —
   // any other error class is unexpected and fails the smoke test.
   await page.waitForTimeout(1200);
-  const unexpected = consoleErrors.filter((e) => !/htmx:onLoadError/.test(e));
+  const unexpected = consoleErrors.filter((e) => !/htmx:error/.test(e));
   expect(unexpected, `unexpected console errors:\n${unexpected.join("\n")}`).toEqual([]);
 });

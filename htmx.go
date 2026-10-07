@@ -4,7 +4,7 @@
 // (https://htmx.org), maintained by the Gothic Framework org and imported by the
 // core module's server-side WASM runtime in place of the vendored htmx.min.js.
 //
-// It is a direct, function-by-function translation of htmx v2.0.9: the same
+// It is a direct, function-by-function translation of htmx v4.0.0: the same
 // internal-data model, trigger tokenizer, XMLHttpRequest request cycle, swap +
 // settle pipeline, history support, and extension API. Function names mirror the
 // originals so the two files can be diffed side by side. Where htmx uses
@@ -12,8 +12,8 @@
 // delegates to the browser's JS engine via syscall/js — the faithful behaviour,
 // since it runs in the browser.
 //
-// Versioning tracks upstream htmx (see go.mod): module .../htmx-go/v2 mirrors
-// htmx 2.x; the exposed window.htmx.version reports the upstream string.
+// Versioning tracks upstream htmx (see go.mod): module .../htmx-go/v4 mirrors
+// htmx 4.x; the exposed window.htmx.version reports the upstream string.
 //
 // Call Boot once from a js/wasm entrypoint to install window.htmx and wire the
 // document.
@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the upstream htmx release this port mirrors.
-const Version = "2.0.9"
+const Version = "4.0.0"
 
 // ---------------------------------------------------------------------------
 // JS handles / tiny helpers (Go equivalents of implicit JS globals)
@@ -240,6 +240,10 @@ type nodeData struct {
 	abortable          bool
 	firstInitCompleted bool
 
+	// boostConfig holds a non-"true" hx-boost value (a 4.0-style boost HCON
+	// config) merged onto the element's requests.
+	boostConfig string
+
 	// event data
 	triggerSpec *triggerSpec
 	handledFor  []int
@@ -293,6 +297,22 @@ func cfgFloat(key string) float64 {
 		return v.Float()
 	}
 	return 0
+}
+
+// noSwapMatches reports whether pattern equals one of the config noSwap
+// entries. Upstream stringifies both the entry and the status pattern before
+// comparing (config.noSwap.map(x => x+"") — a config may hold numbers).
+func noSwapMatches(entries js.Value, pattern string) bool {
+	if !entries.Truthy() {
+		return false
+	}
+	n := entries.Get("length").Int()
+	for i := 0; i < n; i++ {
+		if entries.Index(i).String() == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -652,10 +672,11 @@ func internalEval(str string) js.Value {
 
 func onLoadHelper(callback js.Value) js.Value {
 	listener := js.FuncOf(func(_ js.Value, args []js.Value) any {
-		callback.Invoke(args[0].Get("detail").Get("elt"))
+		// v4 semantics: the processed element arrives as the event target.
+		callback.Invoke(args[0].Get("target"))
 		return nil
 	})
-	addEventListenerImpl(js.ValueOf("htmx:load"), listener.Value, undefined, undefined)
+	addEventListenerImpl(js.ValueOf("htmx:after:process"), listener.Value, undefined, undefined)
 	return listener.Value
 }
 
@@ -1095,10 +1116,10 @@ func oobSwap(oobValue string, oobElement js.Value, si *settleInfo, rootNode js.V
 	if oobValue == "true" {
 		// do nothing
 	} else if idx := strings.Index(oobValue, ":"); idx > 0 {
-		swapStyle = oobValue[:idx]
+		swapStyle = normalizeSwapStyle(oobValue[:idx])
 		selector = oobValue[idx+1:]
 	} else {
-		swapStyle = oobValue
+		swapStyle = normalizeSwapStyle(oobValue)
 	}
 	oobElement.Call("removeAttribute", "hx-swap-oob")
 	oobElement.Call("removeAttribute", "data-hx-swap-oob")
@@ -1116,26 +1137,21 @@ func oobSwap(oobValue string, oobElement js.Value, si *settleInfo, rootNode js.V
 			details.Set("shouldSwap", true)
 			details.Set("target", target)
 			details.Set("fragment", fragment)
-			if !triggerEvent(target, "htmx:oobBeforeSwap", details) {
-				continue
-			}
 			target = details.Get("target")
 			if details.Get("shouldSwap").Bool() {
 				handlePreservedElements(fragment)
 				swapWithStyle(swapStyle, target, target, fragment, si)
 				restorePreservedElements()
 			}
-			for _, elt := range si.elts {
-				triggerEvent(elt, "htmx:oobAfterSwap", details)
-			}
 		}
 		oobElement.Get("parentNode").Call("removeChild", oobElement)
 	} else {
 		oobElement.Get("parentNode").Call("removeChild", oobElement)
+		// v4 has no oob events; a missing OOB target is a logged error.
 		d := newObject()
-		d.Set("content", oobElement)
+		d.Set("event", "htmx:oobErrorNoTarget")
 		d.Set("target", selector)
-		triggerErrorEvent(getDocument().Get("body"), "htmx:oobErrorNoTarget", d)
+		logError(d)
 	}
 	return oobValue
 }
@@ -1201,7 +1217,6 @@ func makeAjaxLoadTask(child js.Value) func() {
 		removeClassFromElement(child, cfgStr("addedClass"), 0)
 		processNode(asElement(child))
 		processFocus(asParentNode(child))
-		triggerEvent(child, "htmx:load", undefined)
 	}
 }
 
@@ -1281,8 +1296,9 @@ func deInitNode(element js.Value) {
 }
 
 func cleanUpElement(element js.Value) {
-	triggerEvent(element, "htmx:beforeCleanupElement", undefined)
+	triggerEvent(element, "htmx:before:cleanup", undefined)
 	deInitNode(element)
+	triggerEvent(element, "htmx:after:cleanup", undefined)
 	for _, child := range jsArrayToSlice(element.Get("children")) {
 		cleanUpElement(child)
 	}
@@ -1358,12 +1374,531 @@ func swapInnerHTML(target, fragment js.Value, si *settleInfo) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Morph + outerSync swap styles (v4 built-ins)
+// ---------------------------------------------------------------------------
+
+// swapOuterSync adopts the fragment's first element's attributes onto the
+// remaining target and replaces its children — the style used for body swaps
+// of whole-document responses.
+func swapOuterSync(target, fragment js.Value, si *settleInfo) {
+	first := fragment.Get("firstElementChild")
+	if !first.Truthy() {
+		return
+	}
+	morphCopyAttributes(target, first)
+	for _, child := range jsArrayToSlice(target.Get("children")) {
+		cleanUpElement(child)
+	}
+	// The target itself survives: its children are replaced wholesale with the
+	// first fragment element's childNodes (not the element), which is what lets
+	// attributes copied from that element stick — upstream replaceChildren(...)
+	// removes every existing child node first, then appends the new ones in
+	// order.
+	for _, child := range jsArrayToSlice(target.Get("childNodes")) {
+		target.Call("removeChild", child)
+	}
+	for _, node := range jsArrayToSlice(first.Get("childNodes")) {
+		target.Call("appendChild", node)
+	}
+	si.elts = append(si.elts, target)
+	addClassToElement(target, cfgStr("addedClass"), 0)
+	si.tasks = append(si.tasks, makeAjaxLoadTask(target))
+}
+
+// swapMorph is the port of v4's built-in DOM-morphing engine: children are
+// matched by id (and tag/type soft-match) and patched in place instead of
+// being destroyed and recreated, preserving live WASM component state.
+func swapMorph(target, fragment js.Value, si *settleInfo, inner bool) {
+	morph(target, fragment, inner)
+	var newContent []js.Value
+	if inner {
+		newContent = jsArrayToSlice(target.Get("childNodes"))
+	} else {
+		newContent = []js.Value{target}
+	}
+	for _, child := range newContent {
+		if child.Type() != js.TypeObject {
+			continue
+		}
+		if isElement(child) {
+			addClassToElement(child, cfgStr("addedClass"), 0)
+			si.tasks = append(si.tasks, makeAjaxLoadTask(child))
+			si.elts = append(si.elts, child)
+		}
+	}
+}
+
+// morphCtx carries the morph state that upstream keeps on a JS object.
+type morphCtx struct {
+	target        js.Value
+	idMap         map[int]map[string]bool // nodeID → persisted child ids under that node
+	persistentIds map[string]bool
+	pantry        js.Value
+	futureMatches map[int]bool
+}
+
+func (ctx *morphCtx) idSet(node js.Value) map[string]bool { return ctx.idMap[nodeID(node)] }
+
+func morph(oldNode, fragment js.Value, innerHTML bool) {
+	persistentIds, idMap := morphCreateIDMaps(oldNode, fragment)
+	pantry := getDocument().Call("createElement", "div")
+	pantry.Set("hidden", true)
+	getDocument().Get("body").Call("after", pantry)
+	ctx := &morphCtx{target: oldNode, idMap: idMap, persistentIds: persistentIds,
+		pantry: pantry, futureMatches: map[int]bool{}}
+	if innerHTML {
+		morphChildren(ctx, oldNode, fragment, null, null)
+	} else {
+		morphChildren(ctx, oldNode.Get("parentNode"), fragment, oldNode, oldNode.Get("nextSibling"))
+	}
+	morphCleanup(pantry)
+	pantry.Call("remove")
+}
+
+// morphChildren walks the new content and matches it against the old children:
+// matched nodes are patched in place (morphNode), unmatched ones are inserted,
+// and old nodes with no counterpart are removed (or parked in the pantry when
+// they may still match elsewhere in the tree).
+func morphChildren(ctx *morphCtx, oldParent, newParent, insertionPoint, endPoint js.Value) {
+	if !oldParent.Truthy() || !newParent.Truthy() {
+		return
+	}
+	if oldParent.InstanceOf(global.Get("HTMLTemplateElement")) && newParent.InstanceOf(global.Get("HTMLTemplateElement")) {
+		oldParent = oldParent.Get("content")
+		newParent = newParent.Get("content")
+	}
+	if !insertionPoint.Truthy() {
+		insertionPoint = oldParent.Get("firstChild")
+	}
+	newChild := newParent.Get("firstChild")
+	for newChild.Truthy() {
+		var matchedNode js.Value = null
+		if insertionPoint.Truthy() && !insertionPoint.Equal(endPoint) {
+			matchedNode = morphFindBestMatch(ctx, newChild, insertionPoint, endPoint)
+			if matchedNode.Truthy() && !matchedNode.Equal(insertionPoint) {
+				cursor := insertionPoint
+				for cursor.Truthy() && !cursor.Equal(matchedNode) {
+					tempNode := cursor
+					cursor = cursor.Get("nextSibling")
+					// match against upcoming content → keep (move to the end for later use), else drop
+					if isElement(tempNode) && (ctx.idSet(tempNode) != nil || morphMatchesUpcomingSibling(ctx, tempNode, newChild)) {
+						morphMoveBefore(oldParent, tempNode, endPoint)
+					} else {
+						morphRemoveNode(ctx, tempNode)
+					}
+				}
+			}
+		}
+
+		if matchedNode.Truthy() {
+			morphNode(ctx, matchedNode, newChild)
+			insertionPoint = matchedNode.Get("nextSibling")
+			newChild = newChild.Get("nextSibling")
+			continue
+		}
+
+		nextNewChild := newChild.Get("nextSibling")
+		if ctx.idSet(newChild) != nil {
+			// A persisted id arriving at a new position: patch through a
+			// same-tag placeholder so the id-carrying element moves instead of
+			// being destroyed, then process it immediately (upstream htmx.process).
+			placeholder := getDocument().Call("createElement", newChild.Get("tagName"))
+			oldParent.Call("insertBefore", placeholder, insertionPoint)
+			morphNode(ctx, placeholder, newChild)
+			processNode(placeholder)
+			insertionPoint = placeholder.Get("nextSibling")
+		} else {
+			oldParent.Call("insertBefore", newChild, insertionPoint)
+			insertionPoint = newChild.Get("nextSibling")
+		}
+		newChild = nextNewChild
+	}
+
+	for insertionPoint.Truthy() && !insertionPoint.Equal(endPoint) {
+		tempNode := insertionPoint
+		insertionPoint = insertionPoint.Get("nextSibling")
+		morphRemoveNode(ctx, tempNode)
+	}
+}
+
+func morphMatchesUpcomingSibling(ctx *morphCtx, oldElt, startNode js.Value) bool {
+	if ctx.futureMatches[nodeID(oldElt)] {
+		return true
+	}
+	scanLimit := int(cfgFloat("morphScanLimit"))
+	sibling := startNode.Get("nextSibling")
+	for i := 0; sibling.Truthy() && i < scanLimit; i++ {
+		if isElement(sibling) && oldElt.Call("isEqualNode", sibling).Bool() {
+			ctx.futureMatches[nodeID(oldElt)] = true
+			return true
+		}
+		sibling = sibling.Get("nextSibling")
+	}
+	return false
+}
+
+func morphFindBestMatch(ctx *morphCtx, node, startPoint, endPoint js.Value) js.Value {
+	// text nodes match positionally (patch in place via morphNode)
+	if node.Get("nodeType").Int() == 3 {
+		if startPoint.Truthy() && startPoint.Get("nodeType").Int() == 3 {
+			return startPoint
+		}
+		return null
+	}
+	if !isElement(node) {
+		return null
+	}
+	var softMatch js.Value = null
+	displaceMatchCount := 0
+	scanLimit := int(cfgFloat("morphScanLimit"))
+	newSet := ctx.idSet(node)
+	nodeMatchCount := 0
+	if newSet != nil {
+		nodeMatchCount = len(newSet)
+	}
+	// a non-persistent id is inserted, never soft-matched
+	if newSet == nil && jstr(node.Get("id")) != "" {
+		return null
+	}
+	cursor := startPoint
+	for cursor.Truthy() && !cursor.Equal(endPoint) {
+		oldSet := ctx.idSet(cursor)
+		if morphIsSoftMatch(cursor, node) {
+			// Hard match: matching ids found in both nodes
+			if oldSet != nil && newSet != nil && morphHasSharedID(oldSet, newSet) {
+				return cursor
+			}
+			if oldSet == nil {
+				// Exact match: nodes are identical
+				if scanLimit > 0 && cursor.Call("isEqualNode", node).Bool() {
+					return cursor
+				}
+				// Soft match: same tag/type, save as fallback
+				if !softMatch.Truthy() {
+					softMatch = cursor
+				}
+			}
+		}
+		if oldSet != nil {
+			displaceMatchCount += len(oldSet)
+		}
+		// stop if too many id elements would be displaced
+		if displaceMatchCount > nodeMatchCount {
+			break
+		}
+		// don't move elements containing a focused typeable input
+		activeElt := getDocument().Get("activeElement")
+		if activeElt.Truthy() {
+			ss := activeElt.Get("selectionStart")
+			if (ss.Type() == js.TypeNull || ss.Type() == js.TypeUndefined) == false &&
+				cursor.Call("contains", activeElt).Truthy() {
+				break
+			}
+		}
+		// stop scanning when the limit is reached and no ids to match
+		scanLimit--
+		if scanLimit < 1 && nodeMatchCount == 0 {
+			break
+		}
+		cursor = cursor.Get("nextSibling")
+	}
+	// only return the fallback softMatch if it does not match upcoming content
+	if softMatch.Truthy() && morphMatchesUpcomingSibling(ctx, softMatch, node) {
+		return null
+	}
+	return softMatch
+}
+
+func morphIsSoftMatch(oldNode, newNode js.Value) bool {
+	if !isElement(oldNode) || oldNode.Get("tagName").String() != newNode.Get("tagName").String() {
+		return false
+	}
+	// Script tags must be identical to match — never patch a script with different content
+	if oldNode.Get("tagName").String() == "SCRIPT" && !oldNode.Call("isEqualNode", newNode).Bool() {
+		return false
+	}
+	id := oldNode.Get("id").String()
+	return id == "" || id == newNode.Get("id").String()
+}
+
+func morphHasSharedID(a, b map[string]bool) bool {
+	for id := range a {
+		if b[id] {
+			return true
+		}
+	}
+	return false
+}
+
+func morphRemoveNode(ctx *morphCtx, node js.Value) {
+	if ctx.idMapHas(node) {
+		morphMoveBefore(ctx.pantry, node, null)
+	} else {
+		cleanUpElement(node)
+		node.Call("remove")
+	}
+}
+
+func (ctx *morphCtx) idMapHas(node js.Value) bool { return ctx.idSet(node) != nil }
+
+func morphMoveBefore(parentNode, element, after js.Value) {
+	// parentNode.moveBefore preserves the focus-boundary state across moves;
+	// it is new enough that its absence (or a throw, per spec) must fall back
+	// to insertBefore.
+	if parentNode.Get("moveBefore").Truthy() {
+		if _, ok := jsTry(parentNode, "moveBefore", element, after); ok {
+			return
+		}
+	}
+	parentNode.Call("insertBefore", element, after)
+}
+
+func morphNode(ctx *morphCtx, oldNode, newNode js.Value) {
+	if oldNode.Get("nodeType").Int() == 3 { // text node
+		if oldNode.Get("nodeValue").String() != newNode.Get("nodeValue").String() {
+			oldNode.Set("nodeValue", newNode.Get("nodeValue"))
+		}
+		return
+	}
+	if skip := cfgStr("morphSkip"); skip != "" {
+		if matches(oldNode, skip) {
+			return
+		}
+	}
+	morphDetail := newObject()
+	morphDetail.Set("oldNode", oldNode)
+	morphDetail.Set("newNode", newNode)
+	if !triggerExtMethods(oldNode, "htmx:before:morph:node", morphDetail) {
+		return
+	}
+	morphCopyAttributes(oldNode, newNode)
+	if oldNode.InstanceOf(global.Get("HTMLTextAreaElement")) {
+		activeElt := getDocument().Get("activeElement")
+		if !activeElt.Truthy() || !activeElt.Equal(oldNode) {
+			if oldNode.Get("defaultValue").String() != newNode.Get("defaultValue").String() {
+				oldNode.Set("value", newNode.Get("value"))
+			}
+		}
+	}
+	skipChildren := false
+	if skip := cfgStr("morphSkipChildren"); skip != "" && matches(oldNode, skip) {
+		skipChildren = true
+	}
+	// isEqualNode does not detect a template content difference, so morph templates
+	if !skipChildren && (!oldNode.Call("isEqualNode", newNode).Bool() ||
+		newNode.Get("tagName").String() == "TEMPLATE" ||
+		(newNode.Get("nodeType").Int() == 1 && newNode.Call("querySelector", "template").Truthy())) {
+		morphChildren(ctx, oldNode, newNode, null, null)
+	}
+}
+
+// morphCopyAttributes adopts newNode's attribute set onto oldNode. Returns
+// whether any hx-* attribute changed, which means the element must be torn
+// down and re-initialized with its new attributes.
+func morphCopyAttributes(destination, source js.Value) bool {
+	ignored := func(name string) bool {
+		arr := cfg("morphIgnore")
+		if arr.Type() != js.TypeObject {
+			return false
+		}
+		for i := 0; i < arr.Get("length").Int(); i++ {
+			if strings.HasPrefix(name, jstr(arr.Index(i))) {
+				return true
+			}
+		}
+		return false
+	}
+	isHxAttr := func(name string) bool {
+		return strings.HasPrefix(name, "hx-") || strings.HasPrefix(name, "data-hx-")
+	}
+	needsReinit := false
+	srcAttrs := source.Get("attributes")
+	for i := 0; i < srcAttrs.Get("length").Int(); i++ {
+		attr := srcAttrs.Index(i)
+		name := attr.Get("name").String()
+		value := attr.Get("value").String()
+		if ignored(name) {
+			continue
+		}
+		current := destination.Call("getAttribute", name)
+		if current.Type() == js.TypeString && current.String() == value {
+			continue
+		}
+		if isHxAttr(name) {
+			needsReinit = true
+		}
+		morphDetail := newObject()
+		morphDetail.Set("attrName", name)
+		morphDetail.Set("newValue", value)
+		if !triggerExtMethods(destination, "htmx:before:morph:attr", morphDetail) {
+			continue
+		}
+		destination.Call("setAttribute", name, value)
+		if name == "value" && destination.InstanceOf(global.Get("HTMLInputElement")) &&
+			destination.Get("type").String() != "file" {
+			activeElt := getDocument().Get("activeElement")
+			if !activeElt.Truthy() || !activeElt.Equal(destination) {
+				destination.Set("value", value)
+			}
+		}
+	}
+	dstAttrs := destination.Get("attributes")
+	for i := dstAttrs.Get("length").Int() - 1; i >= 0; i-- {
+		attr := dstAttrs.Index(i)
+		// NamedNodeMap mutates live; an already-removed entry reads back null
+		if !attr.Truthy() || attr.Type() != js.TypeObject {
+			continue
+		}
+		name := attr.Get("name").String()
+		if source.Call("hasAttribute", name).Bool() || ignored(name) {
+			continue
+		}
+		if isHxAttr(name) {
+			needsReinit = true
+		}
+		morphDetail := newObject()
+		morphDetail.Set("attrName", name)
+		morphDetail.Set("newValue", null)
+		if !triggerExtMethods(destination, "htmx:before:morph:attr", morphDetail) {
+			continue
+		}
+		destination.Call("removeAttribute", name)
+	}
+	if needsReinit {
+		cleanUpElement(destination)
+	}
+	return needsReinit
+}
+
+// triggerExtMethods dispatches a v4 extension-only hook (htmx:before:morph:node,
+// htmx:before:morph:attr) to every active extension that defines the
+// corresponding underscored method. It mirrors upstream __triggerExtensions:
+// any hook returning false cancels, and cancellation stops later hooks.
+func triggerExtMethods(elt js.Value, eventName string, detail js.Value) bool {
+	if !elt.Truthy() {
+		return true
+	}
+	if !detail.Truthy() {
+		detail = newObject()
+	}
+	detail.Set("cancelled", false)
+	cancelled := false
+	withExtensions(elt, func(ext js.Value) {
+		if cancelled {
+			return
+		}
+		fn := ext.Get(strings.ReplaceAll(eventName, ":", "_"))
+		if !isFunction(fn) {
+			return
+		}
+		// A hook is arbitrary third-party code; a throw is contained and the
+		// hook is treated as not-vetoing (the morph continues).
+		res, ok := jsTry(fn, "call", null, elt, detail)
+		if !ok {
+			return
+		}
+		if res.Type() == js.TypeBoolean && !res.Bool() {
+			detail.Set("cancelled", true)
+		}
+		if detail.Get("cancelled").Truthy() {
+			cancelled = true
+		}
+	})
+	return !cancelled
+}
+
+func morphCreateIDMaps(oldNode, newContent js.Value) (map[string]bool, map[int]map[string]bool) {
+	oldIDElements := morphQueryEltAndDescendants(oldNode, "[id]")
+	newIDElements := jsArrayToSlice(newContent.Call("querySelectorAll", "[id]"))
+	persistentIds := morphCreatePersistentIDs(oldIDElements, newIDElements)
+	idMap := map[int]map[string]bool{}
+	morphPopulateIDMapWithTree(idMap, persistentIds, oldNode.Get("parentElement"), oldIDElements)
+	morphPopulateIDMapWithTree(idMap, persistentIds, newContent, newIDElements)
+	return persistentIds, idMap
+}
+
+func morphPopulateIDMapWithTree(idMap map[int]map[string]bool, persistentIds map[string]bool, root js.Value, elements []js.Value) {
+	for _, elt := range elements {
+		id := elt.Get("id").String()
+		if !persistentIds[id] {
+			continue
+		}
+		current := elt
+		for current.Truthy() && (!root.Truthy() || !current.Equal(root)) {
+			nid := nodeID(current)
+			if idMap[nid] == nil {
+				idMap[nid] = map[string]bool{}
+			}
+			idMap[nid][id] = true
+			current = current.Get("parentElement")
+		}
+	}
+}
+
+func morphQueryEltAndDescendants(elt js.Value, selector string) []js.Value {
+	out := []js.Value{}
+	if elt.Call("querySelectorAll", selector).Truthy() {
+		out = jsArrayToSlice(elt.Call("querySelectorAll", selector))
+	}
+
+	if elt.Call("matches", selector).Truthy() {
+		out = append([]js.Value{elt}, out...)
+	}
+	return out
+}
+
+func morphCreatePersistentIDs(oldIDElements, newIDElements []js.Value) map[string]bool {
+	duplicateIDs := map[string]bool{}
+	oldIDTagNameMap := map[string]string{}
+	for _, elt := range oldIDElements {
+		id := elt.Get("id").String()
+		if _, seen := oldIDTagNameMap[id]; seen {
+			duplicateIDs[id] = true
+		} else if id != "" {
+			oldIDTagNameMap[id] = elt.Get("tagName").String()
+		}
+	}
+	persistentIds := map[string]bool{}
+	for _, elt := range newIDElements {
+		id := elt.Get("id").String()
+		if persistentIds[id] {
+			duplicateIDs[id] = true
+		} else if oldIDTagNameMap[id] == elt.Get("tagName").String() {
+			persistentIds[id] = true
+		}
+	}
+	for id := range duplicateIDs {
+		delete(persistentIds, id)
+	}
+	return persistentIds
+}
+
+// morphCleanup tears down the htmx state of elt and all its descendants
+// (upstream __cleanup with the descendant sweep).
+func morphCleanup(elt js.Value) {
+	cleanUpElement(elt)
+}
+
 func swapWithStyle(swapStyle string, elt, target, fragment js.Value, si *settleInfo) {
+	swapStyle = normalizeSwapStyle(swapStyle)
 	switch swapStyle {
 	case "none":
 		return
 	case "outerHTML":
 		swapOuterHTML(target, fragment, si)
+		return
+	case "outerSync":
+		swapOuterSync(target, fragment, si)
+		return
+	case "innerMorph":
+		swapMorph(target, fragment, si, true)
+		return
+	case "outerMorph":
+		swapMorph(target, fragment, si, false)
+		return
+	case "textContent":
+		target.Set("textContent", fragment.Get("textContent"))
 		return
 	case "afterbegin":
 		swapAfterBegin(target, fragment, si)
@@ -1404,9 +1939,33 @@ func swapWithStyle(swapStyle string, elt, target, fragment js.Value, si *settleI
 		if swapStyle == "innerHTML" {
 			swapInnerHTML(target, fragment, si)
 		} else {
-			swapWithStyle(cfgStr("defaultSwapStyle"), elt, target, fragment, si)
+			// v4 throws for an unknown style, but a panic traps the wasm core, so
+			// the error is logged and the default style runs instead (the guard
+			// below keeps a bogus defaultSwapStyle config from recursing).
+			logError("Unknown swap style: " + swapStyle)
+			fallback := normalizeSwapStyle(cfgStr("defaultSwapStyle"))
+			if swapStyle == fallback {
+				swapInnerHTML(target, fragment, si)
+			} else {
+				swapWithStyle(fallback, elt, target, fragment, si)
+			}
 		}
 	}
+}
+
+// normalizeSwapStyle maps the v4 positional aliases to their canonical long forms.
+func normalizeSwapStyle(style string) string {
+	switch style {
+	case "before":
+		return "beforebegin"
+	case "after":
+		return "afterend"
+	case "prepend":
+		return "afterbegin"
+	case "append":
+		return "beforeend"
+	}
+	return style
 }
 
 func findAndSwapOobElements(fragment js.Value, si *settleInfo, rootNode js.Value) bool {
@@ -1441,18 +2000,18 @@ type swapOptions struct {
 
 // swapSpecT mirrors HtmxSwapSpecification.
 type swapSpecT struct {
-	swapStyle     string
-	swapDelay     float64
-	settleDelay   float64
-	transition    bool
-	hasTransition bool
-	ignoreTitle   bool
+	swapStyle      string
+	swapDelay      float64
+	settleDelay    float64
+	transition     bool
+	hasTransition  bool
+	ignoreTitle    bool
 	hasIgnoreTitle bool
-	scroll        string
-	scrollTarget  string
-	show          string
-	showTarget    string
-	focusScroll   bool
+	scroll         string
+	scrollTarget   string
+	show           string
+	showTarget     string
+	focusScroll    bool
 	hasFocusScroll bool
 }
 
@@ -1483,7 +2042,15 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 		si := makeSettleInfo(target)
 
 		if spec.swapStyle == "textContent" {
-			target.Set("textContent", content)
+			// v4 cleans up the htmx state of the outgoing content before the
+			// text replaces it (the built-in style's engine step). The text is
+			// the PARSED fragment's text — fragment.textContent, not the raw
+			// response markup, which would land as escaped literal text.
+			for _, child := range jsArrayToSlice(target.Get("children")) {
+				cleanUpElement(child)
+			}
+			fragment := makeFragment(content)
+			target.Set("textContent", fragment.Get("textContent"))
 		} else {
 			fragment := makeFragment(content)
 			if opts.title.Truthy() {
@@ -1553,7 +2120,7 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 			if elt.Get("classList").Truthy() {
 				elt.Get("classList").Call("add", cfgStr("settlingClass"))
 			}
-			triggerEvent(elt, "htmx:afterSwap", opts.eventInfo)
+			triggerEvent(elt, "htmx:after:swap", opts.eventInfo)
 		}
 		maybeCall(opts.afterSwapCallback)
 
@@ -1562,6 +2129,11 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 		}
 
 		doSettle := func() {
+			for _, elt := range si.elts {
+				if elt.Get("classList").Truthy() {
+					triggerEvent(elt, "htmx:before:settle", opts.eventInfo)
+				}
+			}
 			for _, task := range si.tasks {
 				task()
 			}
@@ -1569,7 +2141,7 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 				if elt.Get("classList").Truthy() {
 					removeClassFromElement(elt, cfgStr("settlingClass"), 0)
 				}
-				triggerEvent(elt, "htmx:afterSettle", opts.eventInfo)
+				triggerEvent(elt, "htmx:after:settle", opts.eventInfo)
 			}
 			if opts.anchor != "" {
 				anchorTarget := asElement(resolveTarget(js.ValueOf("#"+opts.anchor), undefined))
@@ -1606,8 +2178,14 @@ func swap(target js.Value, content string, spec *swapSpecT, opts *swapOptions) {
 			doSwap()
 		}
 	})
+	// v4 fires the finally event on the source element for every swap round,
+	// success or error.
+	triggerEvent(elt, "htmx:finally:swap", opts.eventInfo)
 	if threw {
-		triggerErrorEvent(elt, "htmx:swapError", opts.eventInfo)
+		// v4 folds swap errors into htmx:error.
+		d := newObject()
+		d.Set("error", "htmx swap failed on "+jstr(elt.Call("nodeName")))
+		triggerErrorEvent(elt, "htmx:error", d)
 	}
 }
 
@@ -1736,7 +2314,7 @@ func maybeGenerateConditional(elt js.Value, tokens *[]string, paramName string) 
 				if !built {
 					d := newObject()
 					d.Set("source", conditionalSource)
-					triggerErrorEvent(getDocument().Get("body"), "htmx:syntax:error", d)
+					logError(d)
 					return null
 				}
 				if fn.Truthy() {
@@ -1940,7 +2518,7 @@ func parseAndCacheTrigger(elt js.Value, explicitTrigger string) []*triggerSpec {
 							d.Set("token", tokens[0])
 							tokens = tokens[1:]
 						}
-						triggerErrorEvent(elt, "htmx:syntax:error", d)
+						logError(d)
 					}
 					consumeUntil(&tokens, reNotWhitespace)
 				}
@@ -1964,7 +2542,7 @@ func parseAndCacheTrigger(elt js.Value, explicitTrigger string) []*triggerSpec {
 				d.Set("token", tokens[0])
 				tokens = tokens[1:]
 			}
-			triggerErrorEvent(elt, "htmx:syntax:error", d)
+			logError(d)
 		}
 		consumeUntil(&tokens, reNotWhitespace)
 		if len(tokens) > 0 && tokens[0] == "," {
@@ -2111,7 +2689,7 @@ func maybeFilterEvent(spec *triggerSpec, elt, evt js.Value) bool {
 		if !ok {
 			d := newObject()
 			d.Set("source", eventFilter.Get("source"))
-			triggerErrorEvent(getDocument().Get("body"), "htmx:eventFilter:error", d)
+			logError(d)
 			return true
 		}
 		return result.Truthy() != true // filter passes when result !== true
@@ -2269,7 +2847,7 @@ func maybeReveal(elt js.Value) {
 	} else {
 		opts := newObject()
 		opts.Set("once", true)
-		elt.Call("addEventListener", "htmx:afterProcessNode", js.FuncOf(func(js.Value, []js.Value) any {
+		elt.Call("addEventListener", "htmx:after:init", js.FuncOf(func(js.Value, []js.Value) any {
 			triggerEvent(elt, "revealed", undefined)
 			return nil
 		}), opts)
@@ -2291,10 +2869,37 @@ func loadImmediately(elt js.Value, handler triggerHandler, nodeData *nodeData, d
 	}
 }
 
-var verbsList = []string{"get", "post", "put", "delete", "patch"}
+// verbsList mirrors v4: the named verbs (attribute names scanned for actions).
+// "query" is an accepted verb: hx-action + hx-method="QUERY" / hx-query send an
+// HTTP QUERY with the parameters in the body. Custom methods pass through as-is.
+var verbsList = []string{"get", "post", "put", "delete", "patch", "query"}
 
 func processVerbs(elt js.Value, nodeData *nodeData, triggerSpecs []*triggerSpec) bool {
 	explicitAction := false
+	// hx-action + hx-method is the v4 explicit form; the method passes through
+	// as-is (upstream: method.toUpperCase(), GET only when absent).
+	if hasAttribute(elt, "hx-action") {
+		action := getAttributeValue(elt, "hx-action")
+		method := strings.ToLower(getAttributeValue(elt, "hx-method"))
+		if method == "" {
+			method = "get"
+		}
+		explicitAction = true
+		nodeData.path = action
+		nodeData.verb = method
+		verb := method
+		path := action
+		for _, triggerSpec := range triggerSpecs {
+			addTriggerHandler(elt, triggerSpec, nodeData, func(node, evt js.Value) {
+				e := asElement(node)
+				if eltIsDisabled(e).Truthy() {
+					cleanUpElement(e)
+					return
+				}
+				issueAjaxRequest(verb, path, e, evt, nil, false)
+			})
+		}
+	}
 	for _, verb := range verbsList {
 		if hasAttribute(elt, "hx-"+verb) {
 			path := getAttributeValue(elt, "hx-"+verb)
@@ -2526,12 +3131,16 @@ func processHxOnWildcard(elt js.Value) {
 }
 
 func initNode(elt js.Value) {
-	triggerEvent(elt, "htmx:beforeProcessNode", undefined)
+	triggerEvent(elt, "htmx:before:init", undefined)
 	nodeData := getInternalData(elt)
 	triggerSpecs := getTriggerSpecs(elt)
 	hasExplicitHttpAction := processVerbs(elt, nodeData, triggerSpecs)
 	if !hasExplicitHttpAction {
-		if v, _ := getClosestAttributeValue(elt, "hx-boost"); v == "true" {
+		// v4: boosting is per-element (no ancestor inheritance), `false` means
+		// no boost, and any other non-true value is both a boost signal and the
+		// boost HCON config.
+		if v := getAttributeValue(elt, "hx-boost"); v != "" && v != "false" {
+			nodeData.boostConfig = v
 			boostElement(elt, nodeData, triggerSpecs)
 		} else if hasAttribute(elt, "hx-trigger") {
 			for _, triggerSpec := range triggerSpecs {
@@ -2544,7 +3153,7 @@ func initNode(elt js.Value) {
 		initButtonTracking(elt)
 	}
 	nodeData.firstInitCompleted = true
-	triggerEvent(elt, "htmx:afterProcessNode", undefined)
+	triggerEvent(elt, "htmx:after:init", undefined)
 }
 
 func maybeDeInitAndHash(elt js.Value) bool {
@@ -2569,6 +3178,9 @@ func processNode(elt js.Value) {
 		cleanUpElement(elt)
 		return
 	}
+	if !triggerEvent(elt, "htmx:before:process", undefined) {
+		return
+	}
 	var elementsToInit []js.Value
 	if maybeDeInitAndHash(elt) {
 		elementsToInit = append(elementsToInit, elt)
@@ -2588,11 +3200,15 @@ func processNode(elt js.Value) {
 	for _, e := range elementsToInit {
 		initNode(e)
 	}
+	triggerEvent(elt, "htmx:after:process", undefined)
 }
 
-// verbSelector matches any element carrying an hx-VERB / data-hx-VERB attribute.
+// verbSelector matches any element carrying an hx-VERB / data-hx-VERB
+// attribute, or the v4 unified hx-action attribute (upstream includes it in
+// the same selector — an element carrying only hx-action must still be
+// initialised and get its trigger handlers).
 var verbSelector = func() string {
-	var parts []string
+	parts := []string{"[hx-action], [data-hx-action]"}
 	for _, verb := range verbsList {
 		parts = append(parts, "[hx-"+verb+"], [data-hx-"+verb+"]")
 	}
@@ -2629,7 +3245,7 @@ func triggerErrorEvent(elt js.Value, eventName string, detail js.Value) {
 }
 
 func ignoreEventForLogging(eventName string) bool {
-	return eventName == "htmx:afterProcessNode"
+	return eventName == "htmx:after:init"
 }
 
 // withExtensions runs toDo for every extension registered for elt.
@@ -2729,11 +3345,6 @@ func saveToHistoryCache(url string, rootElt js.Value) {
 	newHistoryItem.Set("title", title)
 	newHistoryItem.Set("scroll", scroll)
 
-	d := newObject()
-	d.Set("item", newHistoryItem)
-	d.Set("cache", historyCache)
-	triggerEvent(getDocument().Get("body"), "htmx:historyItemCreated", d)
-
 	historyCache.Call("push", newHistoryItem)
 	for historyCache.Get("length").Int() > int(cfgFloat("historyCacheSize")) {
 		historyCache.Call("shift")
@@ -2749,7 +3360,7 @@ func saveToHistoryCache(url string, rootElt js.Value) {
 		}
 		ce := newObject()
 		ce.Set("cache", historyCache)
-		triggerErrorEvent(getDocument().Get("body"), "htmx:historyCacheError", ce)
+		logError(ce)
 		historyCache.Call("shift")
 	}
 }
@@ -2794,10 +3405,6 @@ func saveCurrentPageToHistory() {
 	}
 	disableHistoryCache := getDocument().Call("querySelector", `[hx-history="false" i],[data-hx-history="false" i]`)
 	if !disableHistoryCache.Truthy() {
-		d := newObject()
-		d.Set("path", path)
-		d.Set("historyElt", elt)
-		triggerEvent(getDocument().Get("body"), "htmx:beforeHistorySave", d)
 		saveToHistoryCache(path, elt)
 	}
 	if cfgBool("historyEnabled") {
@@ -2858,7 +3465,6 @@ func loadHistoryFromServer(path string) {
 		if status >= 200 && status < 400 {
 			response := this.Get("response")
 			details.Set("response", response)
-			triggerEvent(getDocument().Get("body"), "htmx:historyCacheMissLoad", details)
 			swap(historyElt, jstr(response), spec, &swapOptions{
 				contextElement: historyElt,
 				historyRequest: true,
@@ -2866,19 +3472,12 @@ func loadHistoryFromServer(path string) {
 				eventInfo:      undefined,
 			})
 			setCurrentPathForHistory(path)
-			hr := newObject()
-			hr.Set("path", path)
-			hr.Set("cacheMiss", true)
-			hr.Set("serverResponse", response)
-			triggerEvent(getDocument().Get("body"), "htmx:historyRestore", hr)
 		} else {
-			triggerErrorEvent(getDocument().Get("body"), "htmx:historyCacheMissLoadError", details)
+			logError(details)
 		}
 		return nil
 	}))
-	if triggerEvent(getDocument().Get("body"), "htmx:historyCacheMiss", details) {
-		request.Call("send")
-	}
+	request.Call("send")
 }
 
 func restoreHistory(path string) {
@@ -2886,23 +3485,22 @@ func restoreHistory(path string) {
 	if path == "" {
 		path = location().Get("pathname").String() + location().Get("search").String()
 	}
+	d := newObject()
+	d.Set("path", path)
+	d.Set("cacheMiss", true)
+	if !triggerEvent(getDocument().Get("body"), "htmx:before:history:restore", d) {
+		return
+	}
 	cached := getCachedHistory(path)
 	if cached.Truthy() {
 		spec := &swapSpecT{swapStyle: "innerHTML", swapDelay: 0, settleDelay: 0}
 		historyElt := getHistoryElement()
-		details := newObject()
-		details.Set("path", path)
-		details.Set("item", cached)
-		details.Set("historyElt", historyElt)
-		if triggerEvent(getDocument().Get("body"), "htmx:historyCacheHit", details) {
-			swap(historyElt, cached.Get("content").String(), spec, &swapOptions{
-				contextElement: historyElt,
-				title:          cached.Get("title"),
-				eventInfo:      undefined,
-			})
-			setCurrentPathForHistory(path)
-			triggerEvent(getDocument().Get("body"), "htmx:historyRestore", details)
-		}
+		swap(historyElt, cached.Get("content").String(), spec, &swapOptions{
+			contextElement: historyElt,
+			title:          cached.Get("title"),
+			eventInfo:      undefined,
+		})
+		setCurrentPathForHistory(path)
 	} else if cfgBool("refreshOnHistoryMiss") {
 		global.Get("location").Call("reload", true)
 	} else {
@@ -3100,12 +3698,8 @@ func validateElement(elt js.Value, errors *[]js.Value) {
 	if !element.Get("willValidate").Truthy() {
 		return
 	}
-	triggerEvent(element, "htmx:validation:validate", undefined)
 	if !element.Call("checkValidity").Bool() {
-		d := newObject()
-		d.Set("message", element.Get("validationMessage"))
-		d.Set("validity", element.Get("validity"))
-		if triggerEvent(element, "htmx:validation:failed", d) && len(*errors) == 0 && cfgBool("reportValidityOfForms") {
+		if len(*errors) == 0 && cfgBool("reportValidityOfForms") {
 			element.Call("reportValidity")
 		}
 		e := newObject()
@@ -3308,7 +3902,7 @@ func getSwapSpecification(elt js.Value, swapInfoOverride string, hasOverride boo
 				spec.focusScroll = value[len("focus-scroll:"):] == "true"
 				spec.hasFocusScroll = true
 			case i == 0:
-				spec.swapStyle = value
+				spec.swapStyle = normalizeSwapStyle(value)
 			default:
 				logError("Unknown modifier in hx-swap: " + value)
 			}
@@ -3456,7 +4050,8 @@ func maybeEval(elt js.Value, toEval func() js.Value, defaultVal js.Value) js.Val
 	if cfgBool("allowEval") {
 		return toEval()
 	}
-	triggerErrorEvent(elt, "htmx:evalDisallowedError", undefined)
+	// v4 has no evalDisallowedError event; the gated evaluation simply yields
+	// its default.
 	return defaultVal
 }
 
@@ -3501,7 +4096,7 @@ func getPathFromResponse(xhr js.Value) string {
 		if !ok {
 			d := newObject()
 			d.Set("url", xhr.Get("responseURL"))
-			triggerErrorEvent(getDocument().Get("body"), "htmx:badResponseUrl", d)
+			logError(d)
 			return ""
 		}
 		return url.Get("pathname").String() + url.Get("search").String()
@@ -3534,14 +4129,13 @@ func verifyPath(elt js.Value, path string, requestConfig js.Value) bool {
 	if location().Get("protocol").String() != "about:" {
 		origin = location().Get("origin").String()
 	}
+	// v4 enforces cross-origin policy through config.mode (same-origin by
+	// default) with no validateUrl event.
 	sameHost := origin == url.Get("origin").String()
 	if cfgBool("selfRequestsOnly") && !sameHost {
 		return false
 	}
-	d := newObject()
-	d.Set("url", url)
-	d.Set("sameHost", sameHost)
-	return triggerEvent(elt, "htmx:validateUrl", mergeObjects(d, requestConfig))
+	return true
 }
 
 func window_origin() string { return global.Get("origin").String() }
@@ -3757,6 +4351,43 @@ func newEtc() *ajaxEtc {
 		credentials: undefined, timeout: undefined, event: undefined}
 }
 
+// applyBoostConfig merges a boost HCON value into the request context. In v4
+// the boost value is a full HCON (HCON.merge into ctx at request creation);
+// its keys act as overrides over the corresponding hx-* attributes. Each key
+// only fills a field the caller has not already set, so an explicit
+// htmx.ajax(...) context keeps priority.
+func applyBoostConfig(bc string, elt js.Value, etc *ajaxEtc) {
+	h := hconParse(bc)
+	if s := jstr(h.Get("swap")); s != "" && !etc.hasSwapOverride {
+		etc.swapOverride = s
+		etc.hasSwapOverride = true
+	}
+	if s := jstr(h.Get("select")); s != "" && !etc.hasSelect {
+		etc.selectStr = s
+		etc.hasSelect = true
+	}
+	if s := jstr(h.Get("selectOOB")); s != "" && !etc.hasSelectOOB {
+		etc.selectOOB = s
+		etc.hasSelectOOB = true
+	}
+	if s := jstr(h.Get("push")); s != "" && !etc.hasPush {
+		etc.push = s
+		etc.hasPush = true
+	}
+	if s := jstr(h.Get("replace")); s != "" && !etc.hasReplace {
+		etc.replace = s
+		etc.hasReplace = true
+	}
+	if t := jstr(h.Get("target")); t != "" && !etc.targetOverride.Truthy() {
+		// A boost target is resolved against the boosting element (upstream
+		// __resolveTarget(sourceElement, ctx.target)); an unresolvable selector
+		// is left unset so the element's own hx-target rules still apply.
+		if resolved := asElement(resolveTarget(js.ValueOf(t), undefined)); resolved.Truthy() {
+			etc.targetOverride = resolved
+		}
+	}
+}
+
 func ajaxHelper(verb, path string, context js.Value) js.Value {
 	verb = strings.ToLower(verb)
 	if !context.Truthy() {
@@ -3849,6 +4480,12 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 		resolve()
 		return promise
 	}
+	// v4: the boost value is an HCON merged into the WHOLE request context at
+	// request creation — its keys override swap/target/select/selectOOB/push/
+	// replace for the boosted element (before the target below is resolved).
+	if bc := getInternalData(elt).boostConfig; bc != "" && bc != "true" {
+		applyBoostConfig(bc, elt, etc)
+	}
 	target := etc.targetOverride
 	if !target.Truthy() {
 		target = asElement(getTarget(elt))
@@ -3860,7 +4497,7 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 		} else {
 			d.Set("target", null)
 		}
-		triggerErrorEvent(elt, "htmx:targetError", d)
+		triggerErrorEvent(elt, "htmx:error", d)
 		reject()
 		return promise
 	}
@@ -3872,12 +4509,9 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 			path = buttonPath
 		}
 		if buttonVerb := getRawAttribute(submitter, "formmethod"); buttonVerb != "" {
-			if contains(verbsList, strings.ToLower(buttonVerb)) {
-				verb = strings.ToLower(buttonVerb)
-			} else {
-				resolve()
-				return promise
-			}
+			// v4 passes any submitter method through (formmethod overrides the
+			// element's method); uppercased to the wire in xhr.open.
+			verb = strings.ToLower(buttonVerb)
 		}
 	}
 
@@ -4058,7 +4692,7 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 	requestConfig.Set("path", path)
 	requestConfig.Set("triggeringEvent", event)
 
-	if !triggerEvent(elt, "htmx:configRequest", requestConfig) {
+	if !triggerEvent(elt, "htmx:config:request", requestConfig) {
 		resolve()
 		endRequestLock()
 		return promise
@@ -4071,15 +4705,22 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 	useUrlParams = requestConfig.Get("useUrlParams").Bool()
 	errorsJS := requestConfig.Get("errors")
 
+	// v4: a DIALOG method means the submission controls a <dialog>, not an XHR.
+	if verb == "dialog" {
+		resolve()
+		endRequestLock()
+		return promise
+	}
+
 	if errorsJS.Truthy() && errorsJS.Get("length").Int() > 0 {
-		triggerEvent(elt, "htmx:validation:halted", requestConfig)
+		// validation events are gone in v4: validation halts silently
 		resolve()
 		endRequestLock()
 		return promise
 	}
 
 	// Run the Go-native request transformers. They see the FINAL headers/params
-	// (after htmx:configRequest) and run before the URL is built, before headers
+	// (after htmx:config:request) and run before the URL is built, before headers
 	// are applied to the xhr, and before the body is encoded — so a transformer
 	// that sets a header or a signature parameter reaches the wire. headers and
 	// filteredFormData are mutated in place; verb/path/useUrlParams are returned.
@@ -4109,7 +4750,6 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 	}
 
 	if !verifyPath(elt, finalPath, requestConfig) {
-		triggerErrorEvent(elt, "htmx:invalidPath", requestConfig)
 		reject()
 		endRequestLock()
 		return promise
@@ -4162,8 +4802,8 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 			if !responseInfo.Get("keepIndicators").Truthy() {
 				removeRequestIndicators(indicators, disableElts)
 			}
-			triggerEvent(elt, "htmx:afterRequest", responseInfo)
-			triggerEvent(elt, "htmx:afterOnLoad", responseInfo)
+			triggerEvent(elt, "htmx:after:request", responseInfo)
+			triggerEvent(elt, "htmx:finally:request", responseInfo)
 			if !bodyContains(elt) {
 				var secondary js.Value = null
 				for len(hierarchy) > 0 && !secondary.Truthy() {
@@ -4174,65 +4814,60 @@ func issueAjaxRequest(verb, path string, elt, event js.Value, etc *ajaxEtc, conf
 					}
 				}
 				if secondary.Truthy() {
-					triggerEvent(secondary, "htmx:afterRequest", responseInfo)
-					triggerEvent(secondary, "htmx:afterOnLoad", responseInfo)
+					triggerEvent(secondary, "htmx:after:request", responseInfo)
 				}
 			}
 			resolve()
 		})
 		if threw {
-			triggerErrorEvent(elt, "htmx:onLoadError", responseInfo)
+			e := newObject()
+			e.Set("error", "htmx response handling failed")
+			triggerErrorEvent(elt, "htmx:error", e)
+			triggerEvent(elt, "htmx:finally:request", responseInfo)
 		}
 		endRequestLock()
 		return nil
 	}))
 	xhr.Set("onerror", js.FuncOf(func(js.Value, []js.Value) any {
 		removeRequestIndicators(indicators, disableElts)
-		triggerErrorEvent(elt, "htmx:afterRequest", responseInfo)
-		triggerErrorEvent(elt, "htmx:sendError", responseInfo)
+		e := newObject()
+		e.Set("error", "htmx network error")
+		triggerErrorEvent(elt, "htmx:error", e)
+		triggerEvent(elt, "htmx:finally:request", responseInfo)
 		reject()
 		endRequestLock()
 		return nil
 	}))
 	xhr.Set("onabort", js.FuncOf(func(js.Value, []js.Value) any {
 		removeRequestIndicators(indicators, disableElts)
-		triggerErrorEvent(elt, "htmx:afterRequest", responseInfo)
-		triggerErrorEvent(elt, "htmx:sendAbort", responseInfo)
+		triggerEvent(elt, "htmx:finally:request", responseInfo)
 		reject()
 		endRequestLock()
 		return nil
 	}))
 	xhr.Set("ontimeout", js.FuncOf(func(js.Value, []js.Value) any {
 		removeRequestIndicators(indicators, disableElts)
-		triggerErrorEvent(elt, "htmx:afterRequest", responseInfo)
-		triggerErrorEvent(elt, "htmx:timeout", responseInfo)
+		e := newObject()
+		e.Set("error", "htmx request timed out")
+		triggerErrorEvent(elt, "htmx:error", e)
+		triggerEvent(elt, "htmx:finally:request", responseInfo)
 		reject()
 		endRequestLock()
 		return nil
 	}))
-	if !triggerEvent(elt, "htmx:beforeRequest", responseInfo) {
+	// v4 order: indicators go up before the gate, and "before:request" is the
+	// last event before the request goes out (the v2 beforeSend/xhr:* events
+	// are gone; the request-failure paths fold their signals into htmx:error
+	// and htmx:finally:request).
+	indicators = addRequestIndicatorClasses(elt)
+	disableElts = disableElements(elt)
+	if !triggerEvent(elt, "htmx:before:request", responseInfo) {
+		removeRequestIndicators(indicators, disableElts)
+		triggerEvent(elt, "htmx:finally:request", responseInfo)
 		resolve()
 		endRequestLock()
 		return promise
 	}
-	indicators = addRequestIndicatorClasses(elt)
-	disableElts = disableElements(elt)
-
-	for _, eventName := range []string{"loadstart", "loadend", "progress", "abort"} {
-		en := eventName
-		for _, tgt := range []js.Value{xhr, xhr.Get("upload")} {
-			tgt.Call("addEventListener", en, js.FuncOf(func(_ js.Value, a []js.Value) any {
-				ev := a[0]
-				d := newObject()
-				d.Set("lengthComputable", ev.Get("lengthComputable"))
-				d.Set("loaded", ev.Get("loaded"))
-				d.Set("total", ev.Get("total"))
-				triggerEvent(elt, "htmx:xhr:"+en, d)
-				return nil
-			}))
-		}
-	}
-	triggerEvent(elt, "htmx:beforeSend", responseInfo)
 	var params js.Value = null
 	if !useUrlParams {
 		params = encodeParamsForBody(xhr, elt, filteredFormData)
@@ -4397,7 +5032,7 @@ func resolveRetarget(elt js.Value, target string) js.Value {
 	if !resolvedTarget.Truthy() {
 		d := newObject()
 		d.Set("target", target)
-		triggerErrorEvent(elt, "htmx:targetError", d)
+		triggerErrorEvent(elt, "htmx:error", d)
 		panic("Invalid re-target " + target)
 	}
 	return resolvedTarget
@@ -4408,7 +5043,7 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 	target := responseInfo.Get("target")
 	responseInfoSelect := jstr(responseInfo.Get("select"))
 
-	if !triggerEvent(elt, "htmx:beforeOnLoad", responseInfo) {
+	if !triggerEvent(elt, "htmx:before:response", responseInfo) {
 		return
 	}
 	if hasHeader(xhr, "HX-Trigger:") {
@@ -4470,6 +5105,44 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 		swapOverride = jstr(xhr.Call("getResponseHeader", "HX-Reswap"))
 		hasSwapOverride = true
 	}
+	// v4 resolves status-driven overrides the way __handleStatusCodes does:
+	// response headers apply first, then for the matching pattern — tried as the
+	// exact status, its two-digit + x form, and the class form — a config noSwap
+	// entry swaps nothing, and an hx-status:<pattern> HCON on the element (or an
+	// ancestor) merges its keys (swap, target, select) over the response
+	// context, so it beats an earlier header exactly as the upstream ctx merge
+	// does. The "+x" patterns slice the string the way JS does (slice(0,2)
+	// clamps at the end), so a sub-3-digit status (XHR status 0 on a failed
+	// request) never panics.
+	status := xhr.Get("status").Int()
+	s := strconv.Itoa(status)
+	twoDigit := s
+	if len(s) > 2 {
+		twoDigit = s[:2]
+	}
+	for _, pattern := range []string{s, twoDigit + "x", s[:1] + "xx"} {
+		if noSwapMatches(cfg("noSwap"), pattern) {
+			swapOverride = "none"
+			hasSwapOverride = true
+			break
+		}
+		if attr, _ := getClosestAttributeValue(elt, "hx-status:"+pattern); attr != "" {
+			if v := hconGet(attr, "swap"); v != "" {
+				swapOverride = v
+				hasSwapOverride = true
+			}
+			if t := hconGet(attr, "target"); t != "" {
+				responseInfo.Set("target", resolveRetarget(elt, t))
+				target = responseInfo.Get("target")
+			}
+			if selectOverride == "" {
+				if sel := hconGet(attr, "select"); sel != "" {
+					selectOverride = sel
+				}
+			}
+			break
+		}
+	}
 
 	serverResponse := jstr(xhr.Get("response"))
 	beforeSwapDetails := newObject()
@@ -4485,7 +5158,7 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 		!triggerEvent(target, responseHandling.Get("event").String(), beforeSwapDetails) {
 		return
 	}
-	if !triggerEvent(target, "htmx:beforeSwap", beforeSwapDetails) {
+	if !triggerEvent(target, "htmx:before:swap", beforeSwapDetails) {
 		return
 	}
 	target = beforeSwapDetails.Get("target")
@@ -4568,17 +5241,17 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 					hu.Set("type", historyUpd.updateType)
 					hu.Set("path", historyUpd.path)
 					h.Set("history", hu)
-					triggerEvent(getDocument().Get("body"), "htmx:beforeHistoryUpdate", mergeObjects(h, responseInfo))
+					triggerEvent(getDocument().Get("body"), "htmx:before:history:update", mergeObjects(h, responseInfo))
 					if historyUpd.updateType == "push" {
 						pushUrlIntoHistory(historyUpd.path)
 						pd := newObject()
 						pd.Set("path", historyUpd.path)
-						triggerEvent(getDocument().Get("body"), "htmx:pushedIntoHistory", pd)
+						triggerEvent(getDocument().Get("body"), "htmx:after:history:push", pd)
 					} else {
 						replaceUrlInHistory(historyUpd.path)
 						pd := newObject()
 						pd.Set("path", historyUpd.path)
-						triggerEvent(getDocument().Get("body"), "htmx:replacedInHistory", pd)
+						triggerEvent(getDocument().Get("body"), "htmx:after:history:replace", pd)
 					}
 				}
 			},
@@ -4588,8 +5261,130 @@ func handleAjaxResponse(elt js.Value, responseInfo js.Value, etc *ajaxEtc) {
 	if isError {
 		d := newObject()
 		d.Set("error", "Response Status Error Code "+strconv.Itoa(xhr.Get("status").Int())+" from "+jstr(responseInfo.Get("pathInfo").Get("requestPath")))
-		triggerErrorEvent(elt, "htmx:responseError", mergeObjects(d, responseInfo))
+		triggerErrorEvent(elt, "htmx:response:error", mergeObjects(d, responseInfo))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// HCON — the v4 mini config language (subset)
+// ---------------------------------------------------------------------------
+
+// hconParse parses the subset of the v4 HCON mini-config language the port
+// needs: a JSON object, or bare `key: value` / `key value` pairs separated by
+// whitespace or commas (bare keys map to "true", values are JSON-parsed when
+// possible, and dotted keys nest). The result is a plain JS object.
+func hconParse(content string) js.Value {
+	out := newObject()
+	if content == "" {
+		return out
+	}
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(trimmed, "{") {
+		if v, ok := jsTry(global.Get("JSON"), "parse", trimmed); ok {
+			return v
+		}
+		return out
+	}
+	// Split at top-level commas honoring quoted strings, then parse each token
+	// as key (colon) value.
+	var tokens []string
+	var cur strings.Builder
+	inQuote, quoteChar := false, byte(0)
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if inQuote {
+			cur.WriteByte(c)
+			if c == quoteChar {
+				inQuote = false
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			inQuote, quoteChar = true, c
+			cur.WriteByte(c)
+		case ',', ' ':
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		key := tok
+		val := "true"
+		if j := strings.Index(tok, ":"); j > 0 {
+			key = tok[:j]
+			val = tok[j+1:]
+			if val == "" {
+				// A trailing colon is a separator too: the value bound after
+				// `key\s*:\s*` may be the next token entirely (`swap: outerHTML`,
+				// tokens `["swap:", "outerHTML"]`). If nothing follows, the pair
+				// never matched upstream — skip it.
+				if i+1 >= len(tokens) {
+					continue
+				}
+				i++
+				val = tokens[i]
+			}
+		}
+		val = strings.Trim(val, "\"'")
+		var parsed js.Value
+		switch {
+		case val == "true":
+			parsed = js.ValueOf(true)
+		case val == "false":
+			parsed = js.ValueOf(false)
+		case val == "null":
+			parsed = null
+		default:
+			if f, err := strconv.ParseFloat(val, 64); err == nil {
+				parsed = js.ValueOf(f)
+			} else if strings.HasPrefix(val, "{") {
+				if v, ok := jsTry(global.Get("JSON"), "parse", val); ok {
+					parsed = v
+				} else {
+					parsed = js.ValueOf(val)
+				}
+			} else {
+				parsed = js.ValueOf(val)
+			}
+		}
+		parts := strings.Split(key, ".")
+		target := out
+		for _, seg := range parts[:len(parts)-1] {
+			nxt := target.Get(seg)
+			if !nxt.Truthy() || !nxt.Get("constructor").Truthy() || !isRawObject(nxt.Get("constructor")) {
+				nxt = newObject()
+				target.Set(seg, nxt)
+			}
+			target = nxt
+		}
+		target.Set(parts[len(parts)-1], parsed)
+	}
+	return out
+}
+
+// hconGet reads one dotted key out of an HCON string ("" when absent).
+func hconGet(content, key string) string {
+	v := hconParse(content)
+	parts := strings.Split(key, ".")
+	for _, seg := range parts {
+		if !v.Truthy() {
+			return ""
+		}
+		v = v.Get(seg)
+	}
+	if v.Type() == js.TypeString {
+		return v.String()
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -4612,14 +5407,48 @@ func extensionBase() js.Value {
 
 var internalAPIObject js.Value
 
-func defineExtension(name string, extension js.Value) {
+// registeredExtensions backs the v4 allowlist: a name registers at most once,
+// and only names listed in config.extensions (from the htmx-config meta tag)
+// may register when that allowlist is non-empty. The four default per-extension
+// handlers are merged into every registered extension, so an extension body can
+// rely on them existing (see extensionBase).
+var registeredExtensions = map[string]bool{}
+
+// allowlistedExtension applies the v4 extension allowlist: config.extensions is
+// empty by default, which admits everything; when the meta tag lists names, any
+// other name is rejected.
+func allowlistedExtension(name string) bool {
+	allow := cfgStr("extensions")
+	if allow == "" {
+		return true
+	}
+	for _, n := range strings.Split(allow, ",") {
+		if strings.TrimSpace(n) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// defineExtension registers an extension under the v4 allowlist rules. It is
+// also reachable as window.htmx.registerExtension (the v4 API name).
+func defineExtension(name string, extension js.Value) bool {
+	if !allowlistedExtension(name) || registeredExtensions[name] {
+		logError("htmx extension \"" + name + "\" not registered: allowlisted or duplicate")
+		return false
+	}
+	registeredExtensions[name] = true
 	if extension.Get("init").Truthy() {
 		extension.Call("init", internalAPIObject)
 	}
 	extensions[name] = mergeObjects(extensionBase(), extension)
+	return true
 }
 
-func removeExtension(name string) { delete(extensions, name) }
+func removeExtension(name string) {
+	delete(extensions, name)
+	delete(registeredExtensions, name)
+}
 
 func getExtensions(elt js.Value, extensionsToReturn []js.Value, extensionsToIgnore []string) []js.Value {
 	if !elt.Truthy() {
@@ -4694,7 +5523,9 @@ func insertIndicatorStyles() {
 func getMetaConfig() js.Value {
 	element := getDocument().Call("querySelector", `meta[name="htmx-config"]`)
 	if element.Truthy() {
-		return parseJSON(element.Get("content").String())
+		// v4 reads the meta tag through the HCON mini-config language (JSON
+		// objects and bare key: value pairs both parse).
+		return hconParse(element.Get("content").String())
 	}
 	return null
 }
@@ -4741,6 +5572,7 @@ func buildConfig() js.Value {
 	c.Set("scrollIntoViewOnBoost", true)
 	c.Set("triggerSpecsCache", null)
 	c.Set("disableInheritance", false)
+	c.Set("extensions", "")
 	rh := global.Get("Array").New()
 	rh.Call("push", respHandling("204", false, false))
 	rh.Call("push", respHandling("[23]..", true, false))
@@ -4749,6 +5581,14 @@ func buildConfig() js.Value {
 	c.Set("allowNestedOobSwaps", true)
 	c.Set("historyRestoreAsHxRequest", true)
 	c.Set("reportValidityOfForms", false)
+	c.Set("morphIgnore", strArray("data-htmx-powered"))
+	c.Set("morphSkip", "[hx-morph-skip]")
+	c.Set("morphSkipChildren", "[hx-morph-skip-children]")
+	c.Set("morphScanLimit", 10)
+	// Statuses for which the swap is skipped outright during status-pattern
+	// resolution (upstream config defaults; entries may be numbers — both sides
+	// are stringified before comparing).
+	c.Set("noSwap", strArray("204", "304"))
 	return c
 }
 
@@ -4777,7 +5617,7 @@ func parseSwapSpec(o js.Value) *swapSpecT {
 		return spec
 	}
 	if v := o.Get("swapStyle"); v.Truthy() {
-		spec.swapStyle = v.String()
+		spec.swapStyle = normalizeSwapStyle(v.String())
 	}
 	if v := o.Get("swapDelay"); v.Type() == js.TypeNumber {
 		spec.swapDelay = v.Float()
@@ -4910,6 +5750,7 @@ func installAPI() {
 		return nil
 	}))
 	htmxObj.Set("defineExtension", fn(func(_ js.Value, a []js.Value) any { defineExtension(a[0].String(), a[1]); return nil }))
+	htmxObj.Set("registerExtension", fn(func(_ js.Value, a []js.Value) any { defineExtension(a[0].String(), a[1]); return nil }))
 	htmxObj.Set("removeExtension", fn(func(_ js.Value, a []js.Value) any { removeExtension(a[0].String()); return nil }))
 	htmxObj.Set("logAll", fn(func(js.Value, []js.Value) any { logAll(); return nil }))
 	htmxObj.Set("logNone", fn(func(js.Value, []js.Value) any { logNone(); return nil }))
@@ -4985,8 +5826,8 @@ func Install() {
 	setCurrentPathForHistory(location().Get("pathname").String() + location().Get("search").String())
 }
 
-// Start runs the initial document-processing pass (processNode(body)), wires the
-// history/abort/popstate listeners, and fires htmx:load. Call it once, after
+// Start wires the history/abort/popstate listeners and runs the initial
+// document pass (processNode(body)). Call it once, after
 // Install() and after any extensions / request transformers are registered. It
 // is idempotent.
 //
@@ -5004,8 +5845,6 @@ func Start() {
 		insertIndicatorStyles()
 		body := getDocument().Get("body")
 		processNode(body)
-		restoredElts := getDocument().Call("querySelectorAll",
-			`[hx-trigger='restored'],[data-hx-trigger='restored']`)
 		body.Call("addEventListener", "htmx:abort", js.FuncOf(func(_ js.Value, a []js.Value) any {
 			evt := a[0]
 			target := evt.Get("detail").Get("elt")
@@ -5019,7 +5858,7 @@ func Start() {
 			return nil
 		}))
 		// Scope-tied request cancellation. When a subtree is torn down during an
-		// htmx swap, cleanUpElement fires "htmx:beforeCleanupElement" on every
+		// htmx swap, cleanUpElement fires "htmx:before:cleanup" on every
 		// element being removed, while it is still attached — so the event
 		// bubbles here. If such an element has an in-flight request, abort it by
 		// re-firing htmx's own "htmx:abort": the body listener above then calls
@@ -5030,7 +5869,7 @@ func Start() {
 		// skips a normal self-replacing swap, whose request has already
 		// completed (readyState 4, endRequestLock not yet run at cleanup time),
 		// so no spurious abort event fires on successful completion.
-		body.Call("addEventListener", "htmx:beforeCleanupElement", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		body.Call("addEventListener", "htmx:before:cleanup", js.FuncOf(func(_ js.Value, a []js.Value) any {
 			evt := a[0]
 			target := evt.Get("detail").Get("elt")
 			if !target.Truthy() {
@@ -5054,7 +5893,7 @@ func Start() {
 		// never touches the swap/trigger core paths. The dispatch carries no payload
 		// (a notify-style publish): host value-subscribers that read a byte buffer
 		// safely no-op on a bufferless event, while htmx subscribers re-fetch.
-		body.Call("addEventListener", "htmx:afterSwap", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		body.Call("addEventListener", "htmx:after:swap", js.FuncOf(func(_ js.Value, a []js.Value) any {
 			target := asElement(a[0].Get("target"))
 			if !target.Truthy() {
 				return nil
@@ -5082,20 +5921,11 @@ func Start() {
 			event := a[0]
 			if event.Get("state").Truthy() && event.Get("state").Get("htmx").Truthy() {
 				restoreHistory("")
-				for _, elt := range jsArrayToSlice(restoredElts) {
-					d := newObject()
-					d.Set("document", getDocument())
-					triggerEvent(elt, "htmx:restored", d)
-				}
 			} else if originalPopstate.Truthy() && originalPopstate.Type() == js.TypeFunction {
 				originalPopstate.Invoke(event)
 			}
 			return nil
 		}))
-		getWindow().Call("setTimeout", js.FuncOf(func(js.Value, []js.Value) any {
-			triggerEvent(body, "htmx:load", newObject())
-			return nil
-		}), 0)
 	})
 }
 

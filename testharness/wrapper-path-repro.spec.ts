@@ -33,9 +33,9 @@ test("3-arg subtree on + programmatic swap: does afterSwap reach subtree + globa
 
       const counts = { subtree: 0, global: 0 };
       // 3-arg subtree form (exactly HTMX.On)
-      hx.on('[data-gothic-scope="S1"]', "htmx:afterSwap", () => counts.subtree++);
+      hx.on('[data-gothic-scope="S1"]', "htmx:after:swap", () => counts.subtree++);
       // 2-arg body form (exactly HTMX.OnGlobal)
-      hx.on("htmx:afterSwap", () => counts.global++);
+      hx.on("htmx:after:swap", () => counts.global++);
 
       // programmatic swap (exactly HTMX.Swap)
       hx.swap("#swap-target", "<span id='swapped'>new</span>", { swapStyle: "innerHTML" });
@@ -62,8 +62,8 @@ test("3-arg subtree on + programmatic ajax: afterSwap reaches listeners", async 
       document.body.appendChild(root);
 
       const counts = { subtree: 0, global: 0 };
-      hx.on('[data-gothic-scope="S2"]', "htmx:afterSwap", () => counts.subtree++);
-      hx.on("htmx:afterSwap", () => counts.global++);
+      hx.on('[data-gothic-scope="S2"]', "htmx:after:swap", () => counts.subtree++);
+      hx.on("htmx:after:swap", () => counts.global++);
 
       hx.ajax("GET", "/fragment", { target: "#ajax-target" });
       setTimeout(() => resolve(counts), 1500);
