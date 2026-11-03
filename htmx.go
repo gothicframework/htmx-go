@@ -1295,13 +1295,50 @@ func deInitNode(element js.Value) {
 	*d = nodeData{lastButtonClicked: null, firstInitCompleted: first}
 }
 
+// cleanupScanFn walks a subtree in JS and returns the elements htmx has
+// initialized. getInternalData stamps each one with __htmxGoId, so the scan is
+// a native querySelectorAll plus one property read per element, and the bridge
+// crosses once with a short array.
+//
+// Why the scan is not a Go recursion: a swap that replaces a large
+// server-rendered table hands htmx thousands of elements it never initialized.
+// Walking them in Go costs several boxed js.Values per element (children array,
+// node type, attribute reads, two dispatched events), and the garbage those
+// boxed values leave behind is what turns a slow swap into a frozen tab. The
+// elements with no state have no listeners, timers, hx-on handlers or internal
+// data to release, so there is nothing to tear down.
+var cleanupScanFn js.Value
+
+func initializedElements(root js.Value) []js.Value {
+	if !cleanupScanFn.Truthy() {
+		cleanupScanFn = global.Get("Function").New("root", `
+			var out = [];
+			if (root.__htmxGoId !== undefined) out.push(root);
+			var all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+			for (var i = 0; i < all.length; i++) {
+				if (all[i].__htmxGoId !== undefined) out.push(all[i]);
+			}
+			return out;
+		`)
+	}
+	return jsArrayToSlice(cleanupScanFn.Invoke(root))
+}
+
+// cleanUpElement releases htmx state for root and every initialized element
+// below it, in document order. Elements that were never initialized are skipped
+// entirely: their cleanup events have no listeners that htmx installed, and
+// creating internal data for them (as a full walk would) only grows the page's
+// state map.
 func cleanUpElement(element js.Value) {
+	for _, elt := range initializedElements(element) {
+		cleanUpInitialized(elt)
+	}
+}
+
+func cleanUpInitialized(element js.Value) {
 	triggerEvent(element, "htmx:before:cleanup", undefined)
 	deInitNode(element)
 	triggerEvent(element, "htmx:after:cleanup", undefined)
-	for _, child := range jsArrayToSlice(element.Get("children")) {
-		cleanUpElement(child)
-	}
 }
 
 func swapOuterHTML(target, fragment js.Value, si *settleInfo) {
@@ -5858,8 +5895,9 @@ func Start() {
 			return nil
 		}))
 		// Scope-tied request cancellation. When a subtree is torn down during an
-		// htmx swap, cleanUpElement fires "htmx:before:cleanup" on every
-		// element being removed, while it is still attached — so the event
+		// htmx swap, cleanUpElement fires "htmx:before:cleanup" on every MANAGED
+		// element being removed (one carrying htmx internal data), while it is
+		// still attached — so the event
 		// bubbles here. If such an element has an in-flight request, abort it by
 		// re-firing htmx's own "htmx:abort": the body listener above then calls
 		// xhr.abort(), so this reuses htmx's cancellation path and keeps

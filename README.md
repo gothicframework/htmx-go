@@ -183,6 +183,14 @@ verifiable against the reference `htmx.js` checked into this repo:
 - **`hx-vars` and `hx-params` are still honored** — removed upstream in 4.0 —
   because v2-era user layouts continue to use them.
 - **Config keys keep the v2 names** where 4.0 renamed them (e.g. `disableSelector`).
+- **Cleanup visits only what htmx initialized.** Removing a swapped subtree scans
+  it in JS for the internal `__htmxGoId` marker and releases just those elements;
+  upstream fires `htmx:beforeCleanupElement` / `htmx:afterCleanupElement` for
+  every element in the subtree. Walking every node through the Go bridge (two
+  events, an attribute scan and an internal-data entry each) is what made a swap
+  that replaces a large server-rendered table freeze the tab for seconds.
+  Anything htmx manages carries the marker — any `hx-*`/`hx-ext` element, a
+  boosted anchor, a live component — so its cleanup events still fire.
 
 ## Testing
 
